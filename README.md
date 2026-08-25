@@ -27,4 +27,4 @@ auto product  = yafftl::convolve(a, b);
 
 ## Licence
 
-Apache 2.0, see [LICENCE](https://github.com/PolskaKrowa/YAFFTL/LICENCE) for details
+Apache 2.0, see [LICENCE](https://github.com/PolskaKrowa/YAFFTL/blob/main/LICENSE) for details.
