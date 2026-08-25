@@ -20,7 +20,7 @@ I'm being serious, just take a look:
 auto spectrum = yafftl::fft(signal);
 auto back     = yafftl::ifft(spectrum);
 
-// ideally, back will equal spectrum.
+// ideally, back will equal signal.
 
 auto product  = yafftl::convolve(a, b);
 ```
