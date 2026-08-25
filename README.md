@@ -1,4 +1,4 @@
-# yafftl
+# YAFFTL
 Yet Another Fast Fourier Transform library
 
 ---
