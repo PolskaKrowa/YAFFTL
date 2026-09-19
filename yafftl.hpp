@@ -25,7 +25,8 @@
 // 8/4 by (log2 L) mod 4, matching the schedule that was measured fastest for
 // the AVX-512 kernels (8-wide butterflies amortize better when they show up
 // most levels; see fft_radix() below). Leaves at L <= 32 are hardcoded
-// scalar codelets.
+// codelets: an in-register SIMD dft8 where AVX2+FMA or AVX-512 is available
+// (build with -mavx2 -mfma, or -mavx512f -mavx512dq), scalar otherwise.
 //
 // Threading: opt-in only (Options::threads, default 1). Above
 // Options::parallel_threshold, a level's r row-recursions are fanned out
@@ -57,10 +58,15 @@
 #include <vector>
 
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
-  #include <immintrin.h>
   #define YAFFTL_AVX512 1
 #else
   #define YAFFTL_AVX512 0
+#endif
+#if YAFFTL_AVX512 || (defined(__AVX2__) && defined(__FMA__))
+  #include <immintrin.h>
+  #define YAFFTL_SIMD 1
+#else
+  #define YAFFTL_SIMD 0
 #endif
 
 namespace yafftl {
@@ -112,7 +118,7 @@ struct TwiddleSet {
 };
 
 constexpr double kTwoPi = 6.283185307179586476925286766559;
-constexpr double kHalfSqrt2 = 0.70710678118654752440084436210484905;
+constexpr double kHalfSqrt2 = 0.70710678118654752440084436210484905; // or 1/sqrt(2), maths check out that 1/sqrt(n) = sqrt(n)/n
 
 // radix(L): 8 when L >= 64 and (log2 L) mod 4 in {1,2}, else 4. L <= 32 are
 // hardcoded leaves and never consult this.
@@ -198,7 +204,7 @@ inline const TwiddleSet& get_twiddles(std::size_t n) {
 }
 
 
-// AVX-512 column-butterfly kernels, with scalar fallbacks
+// SIMD column-butterfly kernels (AVX-512: 8 lanes, AVX2+FMA: 4 lanes), with scalar fallbacks
 //
 //   radix{4,8}_butterfly_{fwd,inv}(xr, xi, m, twr, twi)
 //     arm j lives at (xr + j*m, xi + j*m); columns c in [0, m) — callers
@@ -208,65 +214,76 @@ inline const TwiddleSet& get_twiddles(std::size_t n) {
 //     inverse: out_r = IDFT_radix(conj(T)*arms)[r]  (untwiddle the inputs,
 //                                                     conjugated core)
 
+#if YAFFTL_SIMD
+
+// One kernel body serves both widths: YAFFTL_V(op) pastes the intrinsic prefix.
 #if YAFFTL_AVX512
+  using vd = __m512d;
+  constexpr std::size_t kLanes = 8;
+  #define YAFFTL_V(op) _mm512_##op
+#else
+  using vd = __m256d;
+  constexpr std::size_t kLanes = 4;
+  #define YAFFTL_V(op) _mm256_##op
+#endif
 
-struct Cx8 { __m512d re, im; };
+struct Cx { vd re, im; };
 
-inline Cx8 cx8_add(Cx8 a, Cx8 b) { return {_mm512_add_pd(a.re, b.re), _mm512_add_pd(a.im, b.im)}; }
-inline Cx8 cx8_sub(Cx8 a, Cx8 b) { return {_mm512_sub_pd(a.re, b.re), _mm512_sub_pd(a.im, b.im)}; }
-inline Cx8 cx8_mul(Cx8 z, Cx8 w) {
-    return {_mm512_fmsub_pd(z.re, w.re, _mm512_mul_pd(z.im, w.im)),
-            _mm512_fmadd_pd(z.im, w.re, _mm512_mul_pd(z.re, w.im))};
+inline Cx cx_add(Cx a, Cx b) { return {YAFFTL_V(add_pd)(a.re, b.re), YAFFTL_V(add_pd)(a.im, b.im)}; }
+inline Cx cx_sub(Cx a, Cx b) { return {YAFFTL_V(sub_pd)(a.re, b.re), YAFFTL_V(sub_pd)(a.im, b.im)}; }
+inline Cx cx_mul(Cx z, Cx w) {
+    return {YAFFTL_V(fmsub_pd)(z.re, w.re, YAFFTL_V(mul_pd)(z.im, w.im)),
+            YAFFTL_V(fmadd_pd)(z.im, w.re, YAFFTL_V(mul_pd)(z.re, w.im))};
 }
-inline Cx8 cx8_mul_i(Cx8 a) { return {_mm512_xor_pd(a.im, _mm512_set1_pd(-0.0)), a.re}; }
-inline Cx8 cx8_mul_neg_i(Cx8 a) { return {a.im, _mm512_xor_pd(a.re, _mm512_set1_pd(-0.0))}; }
-inline Cx8 cx8_2pma(Cx8 p, Cx8 a) {
-    const __m512d two = _mm512_set1_pd(2.0);
-    return {_mm512_fmsub_pd(two, p.re, a.re), _mm512_fmsub_pd(two, p.im, a.im)};
+inline Cx cx_mul_i(Cx a) { return {YAFFTL_V(xor_pd)(a.im, YAFFTL_V(set1_pd)(-0.0)), a.re}; }
+inline Cx cx_mul_neg_i(Cx a) { return {a.im, YAFFTL_V(xor_pd)(a.re, YAFFTL_V(set1_pd)(-0.0))}; }
+inline Cx cx_2pma(Cx p, Cx a) {
+    const vd two = YAFFTL_V(set1_pd)(2.0);
+    return {YAFFTL_V(fmsub_pd)(two, p.re, a.re), YAFFTL_V(fmsub_pd)(two, p.im, a.im)};
 }
 template <int SIGN>
-inline Cx8 cx8_mul_45(Cx8 z) {
-    const __m512d s = _mm512_set1_pd(kHalfSqrt2);
+inline Cx cx_mul_45(Cx z) {
+    const vd s = YAFFTL_V(set1_pd)(kHalfSqrt2);
     if constexpr (SIGN < 0) {
-        return {_mm512_mul_pd(_mm512_add_pd(z.re, z.im), s),
-                _mm512_mul_pd(_mm512_sub_pd(z.im, z.re), s)};
+        return {YAFFTL_V(mul_pd)(YAFFTL_V(add_pd)(z.re, z.im), s),
+                YAFFTL_V(mul_pd)(YAFFTL_V(sub_pd)(z.im, z.re), s)};
     } else {
-        return {_mm512_mul_pd(_mm512_sub_pd(z.re, z.im), s),
-                _mm512_mul_pd(_mm512_add_pd(z.re, z.im), s)};
+        return {YAFFTL_V(mul_pd)(YAFFTL_V(sub_pd)(z.re, z.im), s),
+                YAFFTL_V(mul_pd)(YAFFTL_V(add_pd)(z.re, z.im), s)};
     }
 }
 template <int SIGN>
-inline void cx8_dft4(Cx8 a0, Cx8 a1, Cx8 a2, Cx8 a3, Cx8 out[4]) {
-    const Cx8 s0 = cx8_add(a0, a2), d0 = cx8_sub(a0, a2);
-    const Cx8 s1 = cx8_add(a1, a3), d1 = cx8_sub(a1, a3);
-    out[0] = cx8_add(s0, s1);
-    out[2] = cx8_2pma(s0, out[0]);
-    if constexpr (SIGN < 0) out[1] = cx8_sub(d0, cx8_mul_i(d1));
-    else                    out[1] = cx8_add(d0, cx8_mul_i(d1));
-    out[3] = cx8_2pma(d0, out[1]);
+inline void cx_dft4(Cx a0, Cx a1, Cx a2, Cx a3, Cx out[4]) {
+    const Cx s0 = cx_add(a0, a2), d0 = cx_sub(a0, a2);
+    const Cx s1 = cx_add(a1, a3), d1 = cx_sub(a1, a3);
+    out[0] = cx_add(s0, s1);
+    out[2] = cx_2pma(s0, out[0]);
+    if constexpr (SIGN < 0) out[1] = cx_sub(d0, cx_mul_i(d1));
+    else                    out[1] = cx_add(d0, cx_mul_i(d1));
+    out[3] = cx_2pma(d0, out[1]);
 }
 
-#endif  // YAFFTL_AVX512
+#endif  // YAFFTL_SIMD
 
 inline void radix4_butterfly_fwd(double* xr, double* xi, std::size_t m,
                                   const double* twr, const double* twi) {
-#if YAFFTL_AVX512
-    for (std::size_t c = 0; c < m; c += 8) {
-        Cx8 A[4];
+#if YAFFTL_SIMD
+    for (std::size_t c = 0; c < m; c += kLanes) {
+        Cx A[4];
         for (int j = 0; j < 4; ++j) {
-            A[j].re = _mm512_loadu_pd(xr + j * m + c);
-            A[j].im = _mm512_loadu_pd(xi + j * m + c);
+            A[j].re = YAFFTL_V(loadu_pd)(xr + j * m + c);
+            A[j].im = YAFFTL_V(loadu_pd)(xi + j * m + c);
         }
-        Cx8 out[4];
-        cx8_dft4<-1>(A[0], A[1], A[2], A[3], out);
+        Cx out[4];
+        cx_dft4<-1>(A[0], A[1], A[2], A[3], out);
         A[0] = out[0];
         for (int k = 1; k < 4; ++k) {
-            A[k] = cx8_mul(out[k], {_mm512_loadu_pd(twr + (k - 1) * m + c),
-                                     _mm512_loadu_pd(twi + (k - 1) * m + c)});
+            A[k] = cx_mul(out[k], {YAFFTL_V(loadu_pd)(twr + (k - 1) * m + c),
+                                     YAFFTL_V(loadu_pd)(twi + (k - 1) * m + c)});
         }
         for (int j = 0; j < 4; ++j) {
-            _mm512_storeu_pd(xr + j * m + c, A[j].re);
-            _mm512_storeu_pd(xi + j * m + c, A[j].im);
+            YAFFTL_V(storeu_pd)(xr + j * m + c, A[j].re);
+            YAFFTL_V(storeu_pd)(xi + j * m + c, A[j].im);
         }
     }
 #else
@@ -294,24 +311,24 @@ inline void radix4_butterfly_fwd(double* xr, double* xi, std::size_t m,
 
 inline void radix4_butterfly_inv(double* xr, double* xi, std::size_t m,
                                   const double* twr, const double* twi) {
-#if YAFFTL_AVX512
-    const __m512d neg = _mm512_set1_pd(-0.0);
-    for (std::size_t c = 0; c < m; c += 8) {
-        Cx8 A[4];
+#if YAFFTL_SIMD
+    const vd neg = YAFFTL_V(set1_pd)(-0.0);
+    for (std::size_t c = 0; c < m; c += kLanes) {
+        Cx A[4];
         for (int j = 0; j < 4; ++j) {
-            A[j].re = _mm512_loadu_pd(xr + j * m + c);
-            A[j].im = _mm512_loadu_pd(xi + j * m + c);
+            A[j].re = YAFFTL_V(loadu_pd)(xr + j * m + c);
+            A[j].im = YAFFTL_V(loadu_pd)(xi + j * m + c);
         }
         for (int k = 1; k < 4; ++k) {
-            Cx8 tk{_mm512_loadu_pd(twr + (k - 1) * m + c),
-                   _mm512_xor_pd(_mm512_loadu_pd(twi + (k - 1) * m + c), neg)};
-            A[k] = cx8_mul(A[k], tk);
+            Cx tk{YAFFTL_V(loadu_pd)(twr + (k - 1) * m + c),
+                   YAFFTL_V(xor_pd)(YAFFTL_V(loadu_pd)(twi + (k - 1) * m + c), neg)};
+            A[k] = cx_mul(A[k], tk);
         }
-        Cx8 out[4];
-        cx8_dft4<+1>(A[0], A[1], A[2], A[3], out);
+        Cx out[4];
+        cx_dft4<+1>(A[0], A[1], A[2], A[3], out);
         for (int j = 0; j < 4; ++j) {
-            _mm512_storeu_pd(xr + j * m + c, out[j].re);
-            _mm512_storeu_pd(xi + j * m + c, out[j].im);
+            YAFFTL_V(storeu_pd)(xr + j * m + c, out[j].re);
+            YAFFTL_V(storeu_pd)(xi + j * m + c, out[j].im);
         }
     }
 #else
@@ -347,35 +364,35 @@ inline void radix4_butterfly_inv(double* xr, double* xi, std::size_t m,
 
 inline void radix8_butterfly_fwd(double* xr, double* xi, std::size_t m,
                                   const double* twr, const double* twi) {
-#if YAFFTL_AVX512
-    for (std::size_t c = 0; c < m; c += 8) {
-        Cx8 A[8];
+#if YAFFTL_SIMD
+    for (std::size_t c = 0; c < m; c += kLanes) {
+        Cx A[8];
         for (int j = 0; j < 8; ++j) {
-            A[j].re = _mm512_loadu_pd(xr + j * m + c);
-            A[j].im = _mm512_loadu_pd(xi + j * m + c);
+            A[j].re = YAFFTL_V(loadu_pd)(xr + j * m + c);
+            A[j].im = YAFFTL_V(loadu_pd)(xi + j * m + c);
         }
-        Cx8 s[4], d[4];
+        Cx s[4], d[4];
         for (int j = 0; j < 4; ++j) {
-            s[j] = cx8_add(A[j], A[j + 4]);
-            d[j] = cx8_sub(A[j], A[j + 4]);
+            s[j] = cx_add(A[j], A[j + 4]);
+            d[j] = cx_sub(A[j], A[j + 4]);
         }
-        Cx8 e[4];
+        Cx e[4];
         e[0] = d[0];
-        e[1] = cx8_mul_45<-1>(d[1]);
-        e[2] = cx8_mul_neg_i(d[2]);
-        e[3] = cx8_mul_neg_i(cx8_mul_45<-1>(d[3]));
-        Cx8 E[4], O[4];
-        cx8_dft4<-1>(s[0], s[1], s[2], s[3], E);
-        cx8_dft4<-1>(e[0], e[1], e[2], e[3], O);
-        Cx8 raw[8] = {E[0], O[0], E[1], O[1], E[2], O[2], E[3], O[3]};
+        e[1] = cx_mul_45<-1>(d[1]);
+        e[2] = cx_mul_neg_i(d[2]);
+        e[3] = cx_mul_neg_i(cx_mul_45<-1>(d[3]));
+        Cx E[4], O[4];
+        cx_dft4<-1>(s[0], s[1], s[2], s[3], E);
+        cx_dft4<-1>(e[0], e[1], e[2], e[3], O);
+        Cx raw[8] = {E[0], O[0], E[1], O[1], E[2], O[2], E[3], O[3]};
         A[0] = raw[0];
         for (int k = 1; k < 8; ++k) {
-            A[k] = cx8_mul(raw[k], {_mm512_loadu_pd(twr + (k - 1) * m + c),
-                                     _mm512_loadu_pd(twi + (k - 1) * m + c)});
+            A[k] = cx_mul(raw[k], {YAFFTL_V(loadu_pd)(twr + (k - 1) * m + c),
+                                     YAFFTL_V(loadu_pd)(twi + (k - 1) * m + c)});
         }
         for (int j = 0; j < 8; ++j) {
-            _mm512_storeu_pd(xr + j * m + c, A[j].re);
-            _mm512_storeu_pd(xi + j * m + c, A[j].im);
+            YAFFTL_V(storeu_pd)(xr + j * m + c, A[j].re);
+            YAFFTL_V(storeu_pd)(xi + j * m + c, A[j].im);
         }
     }
 #else
@@ -433,36 +450,36 @@ inline void radix8_butterfly_fwd(double* xr, double* xi, std::size_t m,
 
 inline void radix8_butterfly_inv(double* xr, double* xi, std::size_t m,
                                   const double* twr, const double* twi) {
-#if YAFFTL_AVX512
-    const __m512d neg = _mm512_set1_pd(-0.0);
-    for (std::size_t c = 0; c < m; c += 8) {
-        Cx8 A[8];
+#if YAFFTL_SIMD
+    const vd neg = YAFFTL_V(set1_pd)(-0.0);
+    for (std::size_t c = 0; c < m; c += kLanes) {
+        Cx A[8];
         for (int j = 0; j < 8; ++j) {
-            A[j].re = _mm512_loadu_pd(xr + j * m + c);
-            A[j].im = _mm512_loadu_pd(xi + j * m + c);
+            A[j].re = YAFFTL_V(loadu_pd)(xr + j * m + c);
+            A[j].im = YAFFTL_V(loadu_pd)(xi + j * m + c);
         }
         for (int k = 1; k < 8; ++k) {
-            Cx8 tk{_mm512_loadu_pd(twr + (k - 1) * m + c),
-                   _mm512_xor_pd(_mm512_loadu_pd(twi + (k - 1) * m + c), neg)};
-            A[k] = cx8_mul(A[k], tk);
+            Cx tk{YAFFTL_V(loadu_pd)(twr + (k - 1) * m + c),
+                   YAFFTL_V(xor_pd)(YAFFTL_V(loadu_pd)(twi + (k - 1) * m + c), neg)};
+            A[k] = cx_mul(A[k], tk);
         }
-        Cx8 s[4], d[4];
+        Cx s[4], d[4];
         for (int j = 0; j < 4; ++j) {
-            s[j] = cx8_add(A[j], A[j + 4]);
-            d[j] = cx8_sub(A[j], A[j + 4]);
+            s[j] = cx_add(A[j], A[j + 4]);
+            d[j] = cx_sub(A[j], A[j + 4]);
         }
-        Cx8 e[4];
+        Cx e[4];
         e[0] = d[0];
-        e[1] = cx8_mul_45<+1>(d[1]);
-        e[2] = cx8_mul_i(d[2]);
-        e[3] = cx8_mul_i(cx8_mul_45<+1>(d[3]));
-        Cx8 E[4], O[4];
-        cx8_dft4<+1>(s[0], s[1], s[2], s[3], E);
-        cx8_dft4<+1>(e[0], e[1], e[2], e[3], O);
+        e[1] = cx_mul_45<+1>(d[1]);
+        e[2] = cx_mul_i(d[2]);
+        e[3] = cx_mul_i(cx_mul_45<+1>(d[3]));
+        Cx E[4], O[4];
+        cx_dft4<+1>(s[0], s[1], s[2], s[3], E);
+        cx_dft4<+1>(e[0], e[1], e[2], e[3], O);
         for (int t = 0; t < 4; ++t) { A[2 * t] = E[t]; A[2 * t + 1] = O[t]; }
         for (int j = 0; j < 8; ++j) {
-            _mm512_storeu_pd(xr + j * m + c, A[j].re);
-            _mm512_storeu_pd(xi + j * m + c, A[j].im);
+            YAFFTL_V(storeu_pd)(xr + j * m + c, A[j].re);
+            YAFFTL_V(storeu_pd)(xi + j * m + c, A[j].im);
         }
     }
 #else
@@ -584,6 +601,66 @@ inline void dft8_scalar(double* xr, double* xi) {
     }
 }
 
+#if YAFFTL_SIMD
+// In-register DFT8 built from radix-2 DIF stages. A stage is x*(+1|-1) + partner: the low lane of
+// each pair gets the sum, the high lane (low - high). Stage twiddles are folded into a constant
+// complex multiply (W8^j) and a cheap +/-i swap (W4). Each variant leaves its lanes bit-reversed and
+// fixes that up with the shuffles that are already needed to store, so output is in natural order.
+template <class P>
+inline Cx dif_stage(Cx z, vd sg, P partner) {
+    return {YAFFTL_V(fmadd_pd)(z.re, sg, partner(z.re)), YAFFTL_V(fmadd_pd)(z.im, sg, partner(z.im))};
+}
+
+#if YAFFTL_AVX512
+// One point per lane: three stages (partner = lane^4, ^2, ^1), then one permute undoes the bit reversal.
+template <int SIGN>
+inline void dft8_simd(double* xr, double* xi) {
+    constexpr double c = kHalfSqrt2;
+    const __m512d zero = _mm512_setzero_pd();
+    Cx z{_mm512_loadu_pd(xr), _mm512_loadu_pd(xi)};
+    z = dif_stage(z, _mm512_setr_pd(1, 1, 1, 1, -1, -1, -1, -1), [](__m512d v) { return _mm512_shuffle_f64x2(v, v, 0x4E); });
+    z = cx_mul(z, {_mm512_setr_pd(1, 1, 1, 1, 1, c, 0, -c), _mm512_setr_pd(0, 0, 0, 0, 0, SIGN * c, SIGN * 1.0, SIGN * c)});
+    z = dif_stage(z, _mm512_setr_pd(1, 1, -1, -1, 1, 1, -1, -1), [](__m512d v) { return _mm512_permutex_pd(v, 0x4E); });
+    if constexpr (SIGN < 0) z = {_mm512_mask_mov_pd(z.re, 0x88, z.im), _mm512_mask_sub_pd(z.im, 0x88, zero, z.re)};
+    else                    z = {_mm512_mask_sub_pd(z.re, 0x88, zero, z.im), _mm512_mask_mov_pd(z.im, 0x88, z.re)};
+    z = dif_stage(z, _mm512_setr_pd(1, -1, 1, -1, 1, -1, 1, -1), [](__m512d v) { return _mm512_permute_pd(v, 0x55); });
+    const __m512i bitrev = _mm512_setr_epi64(0, 4, 2, 6, 1, 5, 3, 7);
+    _mm512_storeu_pd(xr, _mm512_permutexvar_pd(bitrev, z.re));
+    _mm512_storeu_pd(xi, _mm512_permutexvar_pd(bitrev, z.im));
+}
+#else
+// Two registers per component (points 0-3 and 4-7): stage 1 is a plain add/sub across them, the other
+// two stages are a 4-point DIF inside each register, and unpacklo/hi interleaves evens with odds.
+template <int SIGN>
+inline void dft8_simd(double* xr, double* xi) {
+    constexpr double c = kHalfSqrt2;
+    const __m256d zero = _mm256_setzero_pd();
+    const Cx lo{_mm256_loadu_pd(xr), _mm256_loadu_pd(xi)}, hi{_mm256_loadu_pd(xr + 4), _mm256_loadu_pd(xi + 4)};
+    auto dft4 = [&](Cx z) {
+        z = dif_stage(z, _mm256_setr_pd(1, 1, -1, -1), [](__m256d v) { return _mm256_permute2f128_pd(v, v, 0x01); });
+        if constexpr (SIGN < 0) z = {_mm256_blend_pd(z.re, z.im, 0x8), _mm256_blend_pd(z.im, _mm256_sub_pd(zero, z.re), 0x8)};
+        else                    z = {_mm256_blend_pd(z.re, _mm256_sub_pd(zero, z.im), 0x8), _mm256_blend_pd(z.im, z.re, 0x8)};
+        return dif_stage(z, _mm256_setr_pd(1, -1, 1, -1), [](__m256d v) { return _mm256_permute_pd(v, 0x5); });
+    };
+    const Cx e = dft4(cx_add(lo, hi));  // lanes: X0, X4, X2, X6
+    const Cx o = dft4(cx_mul(cx_sub(lo, hi), {_mm256_setr_pd(1, c, 0, -c), _mm256_setr_pd(0, SIGN * c, SIGN * 1.0, SIGN * c)}));  // X1, X5, X3, X7
+    _mm256_storeu_pd(xr,     _mm256_unpacklo_pd(e.re, o.re));
+    _mm256_storeu_pd(xr + 4, _mm256_unpackhi_pd(e.re, o.re));
+    _mm256_storeu_pd(xi,     _mm256_unpacklo_pd(e.im, o.im));
+    _mm256_storeu_pd(xi + 4, _mm256_unpackhi_pd(e.im, o.im));
+}
+#endif
+#endif  // YAFFTL_SIMD
+
+template <int SIGN>
+inline void dft8(double* xr, double* xi) {
+#if YAFFTL_SIMD
+    dft8_simd<SIGN>(xr, xi);
+#else
+    dft8_scalar<SIGN>(xr, xi);
+#endif
+}
+
 // Scalar radix-4 column pass over m columns (used only by the L=16 leaf,
 // where m=4 is too small for the AVX-512 kernel's 8-wide groups).
 inline void radix4_column_scalar(double* xr, double* xi, std::size_t m,
@@ -636,7 +713,7 @@ inline void base_transform(double* xr, double* xi, std::size_t n, int sign, cons
         case 1: return;
         case 2: dft2_scalar(xr, xi); return;
         case 4: sign < 0 ? dft4_scalar<-1>(xr, xi) : dft4_scalar<+1>(xr, xi); return;
-        case 8: sign < 0 ? dft8_scalar<-1>(xr, xi) : dft8_scalar<+1>(xr, xi); return;
+        case 8: sign < 0 ? dft8<-1>(xr, xi) : dft8<+1>(xr, xi); return;
         case 16:
             assert(tw && tw->n == 16);
             if (sign < 0) {
@@ -651,9 +728,9 @@ inline void base_transform(double* xr, double* xi, std::size_t n, int sign, cons
             assert(tw && tw->n == 32);
             if (sign < 0) {
                 radix4_butterfly_fwd(xr, xi, 8, tw->wr.data(), tw->wi.data());
-                for (int k = 0; k < 4; ++k) dft8_scalar<-1>(xr + 8 * k, xi + 8 * k);
+                for (int k = 0; k < 4; ++k) dft8<-1>(xr + 8 * k, xi + 8 * k);
             } else {
-                for (int k = 0; k < 4; ++k) dft8_scalar<+1>(xr + 8 * k, xi + 8 * k);
+                for (int k = 0; k < 4; ++k) dft8<+1>(xr + 8 * k, xi + 8 * k);
                 radix4_butterfly_inv(xr, xi, 8, tw->wr.data(), tw->wi.data());
             }
             return;
@@ -738,11 +815,11 @@ inline void transform(double* re, double* im, std::size_t n, bool inverse, Optio
     if (inverse) {
         const double inv_n = 1.0 / static_cast<double>(n);
         std::size_t i = 0;
-#if YAFFTL_AVX512
-        const __m512d vinv = _mm512_set1_pd(inv_n);
-        for (; i + 8 <= n; i += 8) {
-            _mm512_storeu_pd(re + i, _mm512_mul_pd(_mm512_loadu_pd(re + i), vinv));
-            _mm512_storeu_pd(im + i, _mm512_mul_pd(_mm512_loadu_pd(im + i), vinv));
+#if YAFFTL_SIMD
+        const detail::vd vinv = YAFFTL_V(set1_pd)(inv_n);
+        for (; i + detail::kLanes <= n; i += detail::kLanes) {
+            YAFFTL_V(storeu_pd)(re + i, YAFFTL_V(mul_pd)(YAFFTL_V(loadu_pd)(re + i), vinv));
+            YAFFTL_V(storeu_pd)(im + i, YAFFTL_V(mul_pd)(YAFFTL_V(loadu_pd)(im + i), vinv));
         }
 #endif
         for (; i < n; ++i) { re[i] *= inv_n; im[i] *= inv_n; }
@@ -811,5 +888,7 @@ inline std::vector<double> convolve(const std::vector<double>& a, const std::vec
 }
 
 }  // namespace yafftl
+
+#undef YAFFTL_V
 
 #endif  // YAFFTL_HPP
