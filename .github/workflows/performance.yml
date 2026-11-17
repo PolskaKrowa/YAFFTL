@@ -96,6 +96,26 @@ jobs:
           #include <thread>
           #include <vector>
 
+          // ISA path in use, for the banner. v0.2.0+ headers expose their compiled
+          // path via the YAFFTL_SIMD / YAFFTL_AVX512 macros — use them when present.
+          // v0.1.0 predates both and only ever has an AVX-512(F+DQ) path, so fall
+          // back to that. The macros are never referenced unconditionally: this file
+          // is compiled against every published release (release-compare builds it
+          // against each past tag), so it must build against any header version.
+          #if defined(YAFFTL_SIMD)
+            #if YAFFTL_AVX512
+              #define BENCH_ISA "avx512"
+            #elif YAFFTL_SIMD
+              #define BENCH_ISA "avx2"
+            #else
+              #define BENCH_ISA "scalar"
+            #endif
+          #elif defined(__AVX512F__) && defined(__AVX512DQ__)
+            #define BENCH_ISA "avx512"      // v0.1.0-era header: AVX-512 is its only SIMD path
+          #else
+            #define BENCH_ISA "scalar"
+          #endif
+
           // ------------------------------------------------------------------- RNG -----
           static uint64_t splitmix64(uint64_t& s) {
               s += 0x9E3779B97F4A7C15ull;
@@ -336,8 +356,8 @@ jobs:
               }
 
               std::printf("=== YAFFTL benchmark ===\n");
-              std::printf("cpu: %s | %u logical cores | simd=%d avx512=%d\n",
-                          cpu_model().c_str(), std::thread::hardware_concurrency(), YAFFTL_SIMD, YAFFTL_AVX512);
+              std::printf("cpu: %s | %u logical cores | isa=%s\n",
+                          cpu_model().c_str(), std::thread::hardware_concurrency(), BENCH_ISA);
               std::printf("profile=%s reps=%d target=%.0fms threads:", profile.c_str(), reps, target_ms);
               for (unsigned t : threads) std::printf(" %u", t);
               std::printf("\n");
