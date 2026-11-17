@@ -1,0 +1,1131 @@
+# CI — YAFFTL correctness matrix.
+#
+# Self-contained: the test program and the two-TU link check are generated at
+# run time from the heredoc below, compiled against the repository's
+# yafftl.hpp, and executed. Coverage:
+#   * gcc & clang x {scalar, AVX2} x {release, debug}, plus the two-TU ODR check
+#   * AVX-512: native when the runner has it, otherwise under Intel SDE
+#   * sanitizers: ASan+UBSan and ThreadSanitizer over the threaded FFT paths
+#   * MSVC x {default, /arch:AVX2, /arch:AVX512}
+#   * macOS (Apple Silicon, scalar fallback)
+#   * -Werror warning gate on the header
+#
+# NOTE: the correctness suite compares spectra against an independent O(n^2)
+# reference and closed forms. It currently FAILS because transform()/fft()
+# emit the spectrum in a scrambled (per-level transposed) order for n >= 16;
+# the failure output includes the recovered permutation as a diagnostic.
+# Round-trips, threading determinism and convolution are unaffected and pass.
+
+name: CI
+
+on:
+  push:
+    paths-ignore: ['**.md', 'LICENSE']
+  pull_request:
+    paths-ignore: ['**.md', 'LICENSE']
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  src:
+    name: generate test sources
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: heredoc
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ysrc"
+          cat > "${RUNNER_TEMP}/ysrc/test_correctness.cpp" <<'YAFFTL_EOF'
+          // test_correctness.cpp — YAFFTL correctness suite (single file, zero dependencies).
+          //
+          // Embedded at CI time by .github/workflows/ci.yml and nightly-stress.yml; it is
+          // compiled directly against the repository's yafftl.hpp and run on the host.
+          //
+          // CLI:
+          //   test_correctness [--list] [--filter SUBSTR] [--fuzz N] [--seed S]
+          // Env knobs:
+          //   YAFFTL_TEST_LIGHT=1  trim heavy cases (emulated / sanitized / slow hosts)
+          //   YAFFTL_TEST_FULL=1   extend coverage (big exact-integer convolution etc.)
+          //
+          // Exit code: 0 = all green, 1 = failures, 2 = usage error.
+
+          #include "yafftl.hpp"
+
+          #include <chrono>
+          #include <cmath>
+          #include <cstdint>
+          #include <cstdlib>
+          #include <cstring>
+          #include <cstdio>
+          #include <string>
+          #include <thread>
+          #include <vector>
+
+          // ---------------------------------------------------------------- macros ----
+          #define TFW_TEST(name)                                                        \
+              static void tfw_##name##_fn();                                            \
+              static const tfw::Registrar tfw_##name##_reg(#name, &tfw_##name##_fn);    \
+              static void tfw_##name##_fn()
+
+          #define TFW_CHECK(cond) ::tfw::check_fn(!!(cond), __FILE__, __LINE__, #cond)
+          #define TFW_CHECK_MSG(cond, msg) ::tfw::check_fn(!!(cond), __FILE__, __LINE__, (msg))
+
+          namespace tfw {
+
+          using Fn = void (*)();
+          struct Case { const char* name; Fn fn; };
+
+          inline std::vector<Case>& cases() { static std::vector<Case> v; return v; }
+          struct Registrar { Registrar(const char* n, Fn f) { cases().push_back({n, f}); } };
+
+          inline long& n_checks() { static long c = 0; return c; }
+          inline long& n_fails() { static long f = 0; return f; }
+          inline bool& cur_failed() { static bool b = false; return b; }
+
+          inline bool check_fn(bool ok, const char* file, int line, const std::string& what) {
+              ++n_checks();
+              if (!ok) {
+                  ++n_fails();
+                  cur_failed() = true;
+                  std::fprintf(stderr, "    FAIL %s:%d  %s\n", file, line, what.c_str());
+              }
+              return ok;
+          }
+
+          }  // namespace tfw
+
+          // ------------------------------------------------------------------ knobs ----
+          static bool g_light = false;
+          static bool g_full = false;
+          static uint64_t g_seed_base = 0x5EEDC0FFEull;
+
+          static bool env_flag(const char* k) {
+              const char* v = std::getenv(k);  // NOLINT(concurrency-mt-unsafe)
+              return v && *v && *v != '0';
+          }
+          static const char* compiler_id() {
+          #if defined(__clang__)
+              return "clang";
+          #elif defined(__GNUC__)
+              return "gcc";
+          #elif defined(_MSC_VER)
+              return "msvc";
+          #else
+              return "unknown";
+          #endif
+          }
+
+          // ------------------------------------------------------------------- RNG -----
+          static uint64_t splitmix64(uint64_t& s) {
+              s += 0x9E3779B97F4A7C15ull;
+              uint64_t z = s;
+              z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+              z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+              return z ^ (z >> 31);
+          }
+          // uniform double in [-1, 1)
+          static double next_dbl(uint64_t& s) {
+              return (static_cast<double>(splitmix64(s) >> 11) * (1.0 / 9007199254740992.0)) * 2.0 - 1.0;
+          }
+          static uint64_t seed_for(const char* tag, uint64_t extra) {
+              uint64_t h = g_seed_base;
+              for (const char* p = tag; *p; ++p) h = h * 131u + static_cast<uint8_t>(*p);
+              return h ^ (extra * 0x2545F4914F6BBDD3ull);
+          }
+
+          // -------------------------------------------------------- naive reference ----
+          // Deliberately independent of the library: direct O(n^2) summation with
+          // std::cos/std::sin, its own 2*pi digits, its own code path.
+          static constexpr double kNaiveTwoPi = 6.283185307179586;
+
+          static void naive_dft(const std::vector<double>& inr, const std::vector<double>& ini,
+                                std::vector<double>& outr, std::vector<double>& outi, bool inverse) {
+              const size_t n = inr.size();
+              outr.assign(n, 0.0);
+              outi.assign(n, 0.0);
+              const double sign = inverse ? 1.0 : -1.0;
+              const double inv = inverse ? 1.0 / static_cast<double>(n) : 1.0;
+              for (size_t k = 0; k < n; ++k) {
+                  double sr = 0.0, si = 0.0;
+                  for (size_t j = 0; j < n; ++j) {
+                      const double ang = sign * kNaiveTwoPi * static_cast<double>(j) * static_cast<double>(k) /
+                                          static_cast<double>(n);
+                      const double c = std::cos(ang), s = std::sin(ang);
+                      sr += inr[j] * c - ini[j] * s;
+                      si += inr[j] * s + ini[j] * c;
+                  }
+                  outr[k] = sr * inv;
+                  outi[k] = si * inv;
+              }
+          }
+
+          // ---------------------------------------------------------------- helpers ----
+          struct Cx { std::vector<double> re, im; };
+
+          static Cx make_input(size_t n, bool complex_data, uint64_t seed) {
+              Cx x;
+              x.re.assign(n, 0.0);
+              x.im.assign(n, 0.0);
+              for (size_t i = 0; i < n; ++i) {
+                  x.re[i] = next_dbl(seed);
+                  if (complex_data) x.im[i] = next_dbl(seed);
+              }
+              return x;
+          }
+
+          static double max_abs(const std::vector<double>& v) {
+              double m = 0.0;
+              for (double t : v) { const double a = std::fabs(t); if (a > m) m = a; }
+              return m;
+          }
+          static double worst_abs_diff(const Cx& got, const Cx& ref) {
+              const size_t n = ref.re.size();
+              double w = 0.0;
+              for (size_t i = 0; i < n; ++i) {
+                  double e = std::fabs(got.re[i] - ref.re[i]); if (e > w) w = e;
+                  e = std::fabs(got.im[i] - ref.im[i]);         if (e > w) w = e;
+              }
+              return w;
+          }
+          static double scale_of(const Cx& x) {
+              return std::max(1.0, std::max(max_abs(x.re), max_abs(x.im)));
+          }
+
+          // run yafftl::transform on copies of `in`
+          static Cx run_transform(const Cx& in, bool inverse, const yafftl::Options& opts) {
+              Cx out = in;  // copy
+              yafftl::transform(out.re.data(), out.im.data(), out.re.size(), inverse, opts);
+              return out;
+          }
+
+          static std::vector<double> schoolbook(const std::vector<double>& a, const std::vector<double>& b) {
+              std::vector<double> out(a.size() + b.size() - 1, 0.0);
+              for (size_t i = 0; i < a.size(); ++i)
+                  for (size_t j = 0; j < b.size(); ++j) out[i + j] += a[i] * b[j];
+              return out;
+          }
+
+          static std::string g_note;
+          #define NOTE(msg) do { if (!g_note.empty()) g_note += "; "; g_note += (msg); } while (0)
+
+          // =============================================================== the tests ===
+
+          TFW_TEST(next_pow2_and_edges) {
+              TFW_CHECK(yafftl::next_pow2(0) == 1);
+              TFW_CHECK(yafftl::next_pow2(1) == 1);
+              TFW_CHECK(yafftl::next_pow2(2) == 2);
+              TFW_CHECK(yafftl::next_pow2(3) == 4);
+              TFW_CHECK(yafftl::next_pow2(5) == 8);
+              TFW_CHECK(yafftl::next_pow2(1024) == 1024);
+              TFW_CHECK(yafftl::next_pow2(1025) == 2048);
+              TFW_CHECK((yafftl::next_pow2((1ull << 40) + 1)) == (1ull << 41));
+
+              // transform() must reject non-powers-of-two, including 0.
+              double buf[8] = {0};
+              const size_t bad[] = {0, 3, 7, 12, 1000000, (1ull << 20) + 2};
+              for (size_t n : bad) {
+                  bool threw = false;
+                  try { yafftl::transform(buf, buf + 4, n, false); }
+                  catch (const std::invalid_argument&) { threw = true; }
+                  TFW_CHECK_MSG(threw, ("transform should reject n=" + std::to_string(n)).c_str());
+              }
+              // n = 1, 2 are a no-op / butterfly (values checked elsewhere).
+              yafftl::transform(buf, buf + 4, 1, false);
+              yafftl::transform(buf, buf + 4, 2, false);
+          }
+
+          TFW_TEST(highlevel_padding_semantics) {
+              const size_t lens[] = {0, 1, 2, 3, 7, 100, 777, 1000};
+              double worst_tail = 0.0, worst_rt = 0.0;
+              for (size_t len : lens) {
+                  Cx x = make_input(len, true, seed_for("pad", len));  // len==0 -> empty
+                  auto X = yafftl::fft(x.re);                          // real overload
+                  const size_t n = yafftl::next_pow2(len);
+                  TFW_CHECK(X.size() == n);
+                  auto back = yafftl::ifft(X);
+                  TFW_CHECK(back.size() == n);
+                  for (size_t i = 0; i < len; ++i)
+                      worst_rt = std::max(worst_rt, std::fabs(back[i].real() - x.re[i]));
+                  for (size_t i = len; i < n; ++i)
+                      worst_tail = std::max(worst_tail, std::fabs(back[i].real()));
+              }
+              TFW_CHECK(worst_rt <= 1e-9);
+              TFW_CHECK(worst_tail <= 1e-9);
+              NOTE("roundtrip=" + std::to_string(worst_rt) + " tail=" + std::to_string(worst_tail));
+          }
+
+          TFW_TEST(transform_vs_naive_all_sizes) {
+              // Every power of two up to cap: exercises every leaf (2..32), both
+              // butterfly radices, both directions, real and complex inputs.
+              const size_t cap = g_full ? 4096u : (g_light ? 512u : 1024u);
+              double worst_rel = 0.0; size_t worst_n = 0; bool worst_inv = false;
+              std::vector<size_t> diag_done;
+              for (size_t n = 2; n <= cap; n <<= 1) {
+                  for (int variant = 0; variant < 2; ++variant) {
+                      const bool complex_data = variant == 1;
+                      Cx x = make_input(n, complex_data, seed_for("naive", n * 2 + variant));
+                      for (int d = 0; d < 2; ++d) {
+                          const bool inv = d == 1;
+                          Cx ref;
+                          naive_dft(x.re, x.im, ref.re, ref.im, inv);
+                          Cx got = run_transform(x, inv, yafftl::Options{});
+                          const double err = worst_abs_diff(got, ref) / scale_of(ref);
+                          if (err > worst_rel) { worst_rel = err; worst_n = n; worst_inv = inv; }
+                          TFW_CHECK_MSG(err <= 2e-9,
+                              ("n=" + std::to_string(n) + " inv=" + std::to_string(inv) +
+                               " complex=" + std::to_string(complex_data) + " rel_err=" +
+                               std::to_string(err)).c_str());
+                          if (err > 2e-9 &&
+                              std::find(diag_done.begin(), diag_done.end(), n) == diag_done.end()) {
+                              diag_done.push_back(n);
+                              // Diagnose: is the output a fixed permutation of the true DFT?
+                              // (values right, bin order scrambled)
+                              std::vector<int> perm(n, -1);
+                              bool bijection = true;
+                              for (size_t p = 0; p < n && bijection; ++p) {
+                                  for (size_t k = 0; k < n; ++k)
+                                      if (std::fabs(got.re[p] - ref.re[k]) < 1e-9 * scale_of(ref) &&
+                                          std::fabs(got.im[p] - ref.im[k]) < 1e-9 * scale_of(ref)) {
+                                          perm[p] = int(k); break;
+                                      }
+                                  if (perm[p] < 0) bijection = false;
+                              }
+                              if (bijection) {
+                                  std::string head;
+                                  for (size_t p = 0; p < n && p < 16; ++p)
+                                      head += " " + std::to_string(perm[p]);
+                                  NOTE("n=" + std::to_string(n) + ": output is a PERMUTATION of the DFT, "
+                                       "not natural order (pos p holds X[perm[p]]); perm[:16]=" + head);
+                              }
+                          }
+                      }
+                  }
+              }
+              NOTE("worst rel err " + std::to_string(worst_rel) + " at n=" + std::to_string(worst_n) +
+                   " inv=" + std::to_string(worst_inv) + " (cap " + std::to_string(cap) + ")");
+          }
+
+          TFW_TEST(analytic_dc_impulse_tones) {
+              // DC: X[0] = n, everything else ~ 0.
+              {
+                  const size_t n = 256;
+                  std::vector<double> ones(n, 1.0);
+                  auto X = yafftl::fft(ones);
+                  TFW_CHECK(std::fabs(X[0].real() - double(n)) <= 1e-9);
+                  double others = 0;
+                  for (size_t k = 1; k < n; ++k) others = std::max(others, std::abs(X[k]));
+                  TFW_CHECK(others <= 1e-9);
+              }
+              // Impulse at p: X[k] = exp(-2*pi*i*p*k/n), magnitude 1 everywhere.
+              for (size_t p : {size_t(0), size_t(97)}) {
+                  const size_t n = 512;
+                  std::vector<double> x(n, 0.0); x[p] = 1.0;
+                  auto X = yafftl::fft(x);
+                  double worst = 0;
+                  for (size_t k = 0; k < n; ++k) {
+                      const double ang = -kNaiveTwoPi * double(p) * double(k) / double(n);
+                      worst = std::max(worst, std::fabs(X[k].real() - std::cos(ang)));
+                      worst = std::max(worst, std::fabs(X[k].imag() - std::sin(ang)));
+                  }
+                  TFW_CHECK(worst <= 1e-9);
+                  if (p == 97) NOTE("impulse worst=" + std::to_string(worst));
+              }
+              // Pure tones: sine peaks at f and n-f with |X| = A*n/2; cosine spectrum real.
+              {
+                  const size_t n = 1024, f = 17;
+                  const double A = 0.7;
+                  std::vector<double> sine(n), cosine(n);
+                  for (size_t j = 0; j < n; ++j) {
+                      const double t = kNaiveTwoPi * double(f) * double(j) / double(n);
+                      sine[j] = A * std::sin(t);
+                      cosine[j] = A * std::cos(t);
+                  }
+                  auto S = yafftl::fft(sine);
+                  auto C = yafftl::fft(cosine);
+                  const double peak = A * double(n) / 2.0;
+                  TFW_CHECK(std::fabs(std::abs(S[f]) - peak) <= 1e-6 * peak);
+                  TFW_CHECK(std::fabs(std::abs(S[n - f]) - peak) <= 1e-6 * peak);
+                  double others = 0, cimag = 0;
+                  for (size_t k = 0; k < n; ++k) {
+                      if (k != f && k != n - f) others = std::max(others, std::abs(S[k]));
+                      cimag = std::max(cimag, std::fabs(C[k].imag()));
+                  }
+                  TFW_CHECK(others <= 1e-6 * peak);
+                  TFW_CHECK(cimag <= 1e-6 * peak);
+                  NOTE("tone leakage=" + std::to_string(others) + " cos-imag=" + std::to_string(cimag));
+              }
+              // Conjugate symmetry of real input across many sizes.
+              {
+                  const size_t cap = g_full ? 8192u : (g_light ? 1024u : 4096u);
+                  double worst = 0;
+                  for (size_t n = 2; n <= cap; n <<= 1) {
+                      Cx x = make_input(n, false, seed_for("conj", n));  // real input
+                      Cx X = run_transform(x, false, yafftl::Options{});
+                      for (size_t k = 1; k < n / 2; ++k) {
+                          worst = std::max(worst, std::fabs(X.re[n - k] - X.re[k]));
+                          worst = std::max(worst, std::fabs(X.im[n - k] + X.im[k]));
+                      }
+                  }
+                  TFW_CHECK(worst <= 1e-10);
+                  NOTE("conjugate-symmetry worst=" + std::to_string(worst) +
+                       " (cap " + std::to_string(cap) + ")");
+              }
+          }
+
+          TFW_TEST(parseval_and_inverse_scaling) {
+              const size_t sizes[] = {256u, 4096u, 65536u};
+              double worst = 0;
+              for (size_t n : sizes) {
+                  if (n == 65536u && g_light) continue;
+                  Cx x = make_input(n, true, seed_for("pars", n));
+                  Cx X = run_transform(x, false, yafftl::Options{});
+                  double sx = 0, sX = 0;
+                  for (size_t i = 0; i < n; ++i) {
+                      sx += x.re[i] * x.re[i] + x.im[i] * x.im[i];
+                      sX += X.re[i] * X.re[i] + X.im[i] * X.im[i];
+                  }
+                  // No 1/n on forward: sum|X|^2 == n * sum|x|^2.
+                  worst = std::max(worst, std::fabs(sX - double(n) * sx) / (double(n) * sx));
+
+                  // fwd then inv on raw buffers must restore the input exactly once-scaled.
+                  Cx back = run_transform(X, true, yafftl::Options{});
+                  worst = std::max(worst, worst_abs_diff(back, x) / scale_of(x));
+              }
+              TFW_CHECK(worst <= 1e-8);
+              NOTE("worst rel=" + std::to_string(worst));
+          }
+
+          TFW_TEST(roundtrip_sizes) {
+              std::vector<size_t> sizes;
+              for (size_t n = 2; n <= 256; n <<= 1) sizes.push_back(n);
+              sizes.push_back(1024);
+              sizes.push_back(4096);
+              sizes.push_back(65536);
+              if (!g_light) sizes.push_back(1u << 20);  // kMaxSafeIntegerFFTLen
+              double worst = 0; size_t wn = 0;
+              for (size_t n : sizes) {
+                  Cx x = make_input(n, true, seed_for("rt", n));
+                  // low-level pair
+                  Cx X = run_transform(x, false, yafftl::Options{});
+                  Cx back = run_transform(X, true, yafftl::Options{});
+                  double e = worst_abs_diff(back, x) / scale_of(x);
+                  if (e > worst) { worst = e; wn = n; }
+                  // high-level pair
+                  std::vector<std::complex<double>> in(n);
+                  for (size_t i = 0; i < n; ++i) in[i] = {x.re[i], x.im[i]};
+                  auto hi = yafftl::ifft(yafftl::fft(in));
+                  double eh = 0;
+                  for (size_t i = 0; i < n; ++i) {
+                      eh = std::max(eh, std::fabs(hi[i].real() - x.re[i]));
+                      eh = std::max(eh, std::fabs(hi[i].imag() - x.im[i]));
+                  }
+                  eh /= scale_of(x);
+                  if (eh > worst) { worst = eh; wn = n; }
+                  TFW_CHECK_MSG(e <= 5e-9 && eh <= 5e-9,
+                      ("n=" + std::to_string(n) + " low=" + std::to_string(e) +
+                       " high=" + std::to_string(eh)).c_str());
+              }
+              NOTE("worst rel=" + std::to_string(worst) + " at n=" + std::to_string(wn));
+          }
+
+          TFW_TEST(misaligned_buffers) {
+              // The engine promises unaligned-safe access (loadu/storeu everywhere).
+              const size_t n = g_light ? 256u : 1024u;
+              std::vector<double> storage(2 * (n + 2));
+              Cx x = make_input(n, true, seed_for("mis", n));
+              Cx a = x;
+              yafftl::transform(a.re.data(), a.im.data(), n, false, yafftl::Options{});
+
+              double* base_re = storage.data() + 1;          // deliberately misaligned
+              double* base_im = storage.data() + 1 + (n + 2);
+              for (size_t i = 0; i < n; ++i) { base_re[i] = x.re[i]; base_im[i] = x.im[i]; }
+              yafftl::transform(base_re, base_im, n, false, yafftl::Options{});
+
+              // Identical instruction sequence => bit-identical results expected.
+              bool same = true;
+              for (size_t i = 0; i < n; ++i)
+                  same = same && a.re[i] == base_re[i] && a.im[i] == base_im[i];
+              TFW_CHECK(same);
+              Cx ref;
+              naive_dft(x.re, x.im, ref.re, ref.im, false);
+              double err = 0;
+              for (size_t i = 0; i < n; ++i)
+                  err = std::max(err, std::max(std::fabs(base_re[i] - ref.re[i]),
+                                               std::fabs(base_im[i] - ref.im[i])));
+              TFW_CHECK(err / scale_of(ref) <= 2e-9);
+              NOTE("bit-identical to aligned run, matches naive");
+          }
+
+          TFW_TEST(threading_bit_exact) {
+              // Parallel rows are disjoint and there are no cross-thread reductions, so
+              // results must be BIT-IDENTICAL to the single-threaded run. Any mismatch
+              // is a race, not a rounding difference.
+              const size_t n = g_light ? 16384u : 65536u;
+              Cx x = make_input(n, true, seed_for("thr", n));
+              for (int dir = 0; dir < 2; ++dir) {
+                  const bool inv = dir == 1;
+                  yafftl::Options single{1u, 1024u};
+                  Cx ref = run_transform(x, inv, single);
+                  for (unsigned t : {2u, 3u, 4u}) {
+                      yafftl::Options par{t, 1024u};
+                      Cx got = run_transform(x, inv, par);
+                      bool same = true;
+                      for (size_t i = 0; i < n; ++i)
+                          same = same && got.re[i] == ref.re[i] && got.im[i] == ref.im[i];
+                      TFW_CHECK_MSG(same, ("threads=" + std::to_string(t) + " inv=" + std::to_string(inv) +
+                                           " differs from single-threaded").c_str());
+                  }
+              }
+              // High-level API carries the same guarantee.
+              {
+                  std::vector<std::complex<double>> in(n);
+                  for (size_t i = 0; i < n; ++i) in[i] = {x.re[i], x.im[i]};
+                  auto a = yafftl::fft(in, yafftl::Options{1u, 1024u});
+                  auto b = yafftl::fft(in, yafftl::Options{4u, 1024u});
+                  bool same = a.size() == b.size();
+                  for (size_t i = 0; same && i < a.size(); ++i) same = a[i] == b[i];
+                  TFW_CHECK(same);
+              }
+              NOTE("n=" + std::to_string(n) + ", threads 2/3/4 bit-identical to 1");
+          }
+
+          TFW_TEST(twiddle_cache_concurrent_storm) {
+              // Mixed lengths hammered from 8 threads at once: half the lengths are
+              // pre-warmed, the other half get built during the storm. Every result must
+              // equal the single-threaded reference bit-for-bit.
+              const size_t lens[4] = {g_light ? 1024u : 4096u, g_light ? 2048u : 8192u,
+                                      g_light ? 4096u : 16384u, g_light ? 8192u : 32768u};
+              const size_t nmax = lens[3];
+              Cx in[4]; Cx ref[4];
+              for (int L = 0; L < 4; ++L) {
+                  in[L] = make_input(lens[L], true, seed_for("storm", lens[L]));
+                  ref[L] = run_transform(in[L], false, yafftl::Options{});
+              }
+              std::vector<std::vector<double>> bufs_re(8), bufs_im(8);
+              for (int w = 0; w < 8; ++w) { bufs_re[w].assign(nmax, 0.0); bufs_im[w].assign(nmax, 0.0); }
+
+              std::vector<std::thread> pool;
+              for (int w = 0; w < 8; ++w) {
+                  pool.emplace_back([&, w]() {
+                      const int L = w % 4;
+                      const size_t n = lens[L];
+                      for (int it = 0; it < 8; ++it) {
+                          std::memcpy(bufs_re[w].data(), in[L].re.data(), n * sizeof(double));
+                          std::memcpy(bufs_im[w].data(), in[L].im.data(), n * sizeof(double));
+                          yafftl::transform(bufs_re[w].data(), bufs_im[w].data(), n, false, yafftl::Options{});
+                          for (size_t i = 0; i < n; ++i)
+                              if (bufs_re[w][i] != ref[L].re[i] || bufs_im[w][i] != ref[L].im[i]) return;
+                      }
+                  });
+              }
+              for (auto& t : pool) t.join();
+
+              // A thread that saw a mismatch returned early; verify all buffers here.
+              bool all_ok = true;
+              for (int w = 0; w < 8; ++w) {
+                  const int L = w % 4;
+                  const size_t n = lens[L];
+                  for (size_t i = 0; i < n; ++i)
+                      if (bufs_re[w][i] != ref[L].re[i] || bufs_im[w][i] != ref[L].im[i]) { all_ok = false; break; }
+              }
+              TFW_CHECK(all_ok);
+              NOTE("8 threads x 8 iters over 4 mixed lengths, bit-identical");
+          }
+
+          TFW_TEST(convolve_vs_direct) {
+              struct Pair { size_t a, b; };
+              const Pair pairs[] = {{1, 1}, {1, 5}, {2, 3}, {33, 17}, {100, 77}, {777, 543},
+                                    {1024, 1000}, {g_light ? 64u : 6000u, g_light ? 64u : 5000u}};
+              double worst = 0;
+              for (const Pair& p : pairs) {
+                  uint64_t s = seed_for("conv", p.a * 100003 + p.b);
+                  std::vector<double> a(p.a), b(p.b);
+                  for (auto& v : a) v = next_dbl(s);
+                  for (auto& v : b) v = next_dbl(s);
+                  std::vector<double> want = schoolbook(a, b);
+                  std::vector<double> got = yafftl::convolve(a, b);
+                  TFW_CHECK(got.size() == want.size());
+                  const double sc = std::max(1.0, max_abs(want));
+                  for (size_t i = 0; i < want.size(); ++i) {
+                      const double e = std::fabs(got[i] - want[i]);
+                      worst = std::max(worst, e);
+                      TFW_CHECK_MSG(e <= 1e-9 * sc,
+                          ("a=" + std::to_string(p.a) + " b=" + std::to_string(p.b) +
+                           " rel=" + std::to_string(e / sc)).c_str());
+                  }
+                  // Commutativity: values must agree to within a hair. Bit-level identity
+                  // is NOT required: the compiler may version the pointwise-multiply loop
+                  // on buffer alignment / FMA contraction, which can wiggle the last ulp
+                  // between convolve(a,b) and convolve(b,a). Observed: <= 1e-14 relative.
+                  std::vector<double> got2 = yafftl::convolve(b, a);
+                  const double sc2 = std::max(1.0, max_abs(got));
+                  double dcomm = 0;
+                  for (size_t i = 0; i < want.size(); ++i)
+                      dcomm = std::max(dcomm, std::fabs(got[i] - got2[i]));
+                  TFW_CHECK_MSG(dcomm <= 1e-12 * sc2,
+                      ("commutativity a=" + std::to_string(p.a) + " b=" + std::to_string(p.b) +
+                       " diff=" + std::to_string(dcomm)).c_str());
+              }
+              // Associativity: (a*b)*c vs schoolbook of three.
+              {
+                  std::vector<double> a(50), b(60), c(70);
+                  uint64_t s = seed_for("assoc", 1);
+                  for (auto& v : a) v = next_dbl(s);
+                  for (auto& v : b) v = next_dbl(s);
+                  for (auto& v : c) v = next_dbl(s);
+                  std::vector<double> ab = yafftl::convolve(a, b);
+                  std::vector<double> got = yafftl::convolve(ab, c);
+                  std::vector<double> want = schoolbook(schoolbook(a, b), c);
+                  TFW_CHECK(got.size() == want.size());
+                  const double sc = std::max(1.0, max_abs(want));
+                  double e = 0;
+                  for (size_t i = 0; i < want.size(); ++i) e = std::max(e, std::fabs(got[i] - want[i]));
+                  TFW_CHECK(e <= 1e-8 * sc);
+              }
+              // convolve() equals a hand-rolled fft / pointwise / ifft pipeline.
+              {
+                  std::vector<double> a(777), b(543);
+                  uint64_t s = seed_for("manual", 2);
+                  for (auto& v : a) v = next_dbl(s);
+                  for (auto& v : b) v = next_dbl(s);
+                  std::vector<double> got = yafftl::convolve(a, b);
+                  const size_t out_len = a.size() + b.size() - 1;
+                  const size_t n = yafftl::next_pow2(out_len);
+                  std::vector<double> ar(n, 0.0), ai(n, 0.0), br(n, 0.0), bi(n, 0.0);
+                  std::copy(a.begin(), a.end(), ar.begin());
+                  std::copy(b.begin(), b.end(), br.begin());
+                  yafftl::Options o;
+                  yafftl::transform(ar.data(), ai.data(), n, false, o);
+                  yafftl::transform(br.data(), bi.data(), n, false, o);
+                  for (size_t i = 0; i < n; ++i) {
+                      const double rr = ar[i] * br[i] - ai[i] * bi[i];
+                      const double ri = ar[i] * bi[i] + ai[i] * br[i];
+                      ar[i] = rr; ai[i] = ri;
+                  }
+                  yafftl::transform(ar.data(), ai.data(), n, true, o);
+                  double e = 0;
+                  for (size_t i = 0; i < out_len; ++i) e = std::max(e, std::fabs(got[i] - ar[i]));
+                  TFW_CHECK(e <= 1e-9 * std::max(1.0, max_abs(ar)));
+              }
+              // Degenerate shapes.
+              TFW_CHECK(yafftl::convolve(std::vector<double>{}, std::vector<double>{1.0}).empty());
+              TFW_CHECK(yafftl::convolve(std::vector<double>{1.0}, std::vector<double>{}).empty());
+              std::vector<double> one = yafftl::convolve({2.0}, {3.0});
+              TFW_CHECK(one.size() == 1 && std::fabs(one[0] - 6.0) < 0.45 && std::lround(one[0]) == 6);
+              NOTE("worst rel vs schoolbook=" + std::to_string(worst));
+          }
+
+          TFW_TEST(convolve_exact_integer) {
+              // The bignum use case: digit arrays must round to the exact integer
+              // product (round-off < 0.5), well inside the documented 2^20 safety bound.
+              const size_t L = g_light ? 2048u : 8192u;
+              double worst = 0;
+              for (int rep = 0; rep < 2; ++rep) {
+                  std::vector<double> a(L), b(L);
+                  uint64_t s = seed_for("bigint", rep);
+                  for (auto& v : a) v = double(splitmix64(s) % 10);
+                  for (auto& v : b) v = double(splitmix64(s) % 10);
+                  std::vector<double> want = schoolbook(a, b);
+                  std::vector<double> got = yafftl::convolve(a, b);
+                  TFW_CHECK(got.size() == want.size());
+                  for (size_t i = 0; i < want.size(); ++i) {
+                      const double e = std::fabs(got[i] - want[i]);
+                      worst = std::max(worst, e);
+                      TFW_CHECK_MSG(e < 0.45, ("idx=" + std::to_string(i) + " got=" + std::to_string(got[i]) +
+                                               " want=" + std::to_string(want[i])).c_str());
+                      TFW_CHECK_MSG(std::lround(got[i]) == static_cast<long>(want[i]), "rounded value mismatch");
+                  }
+              }
+              if (g_full) {  // big one: 32768 digits, transform length 2^16
+                  const size_t Lb = 32768u;
+                  std::vector<double> a(Lb), b(Lb);
+                  uint64_t s = seed_for("bigint_full", 9);
+                  for (auto& v : a) v = double(splitmix64(s) % 10);
+                  for (auto& v : b) v = double(splitmix64(s) % 10);
+                  std::vector<double> want = schoolbook(a, b);
+                  std::vector<double> got = yafftl::convolve(a, b);
+                  for (size_t i = 0; i < want.size(); ++i)
+                      worst = std::max(worst, std::fabs(got[i] - want[i]));
+              }
+              // Large-magnitude small integers (per-point product head-room guidance).
+              {
+                  std::vector<double> a(16), b(16);
+                  uint64_t s = seed_for("bigmag", 3);
+                  for (auto& v : a) v = double(splitmix64(s) % 300001);
+                  for (auto& v : b) v = double(splitmix64(s) % 300001);
+                  std::vector<double> want = schoolbook(a, b);
+                  std::vector<double> got = yafftl::convolve(a, b);
+                  for (size_t i = 0; i < want.size(); ++i) {
+                      TFW_CHECK(std::fabs(got[i] - want[i]) < 0.45);
+                      TFW_CHECK(std::lround(got[i]) == static_cast<long>(want[i]));
+                  }
+              }
+              NOTE("digits L=" + std::to_string(L) + ", worst |fft - exact| = " + std::to_string(worst) +
+                   " (must stay < 0.5)");
+          }
+
+          TFW_TEST(api_overload_consistency) {
+              // fft(vector<double>) must equal fft(same data as complex) bit-for-bit:
+              // identical inputs flow through identical code.
+              const size_t len = 777;
+              Cx x = make_input(len, false, seed_for("ovl", len));
+              auto A = yafftl::fft(x.re);
+              std::vector<std::complex<double>> as_c(len);
+              for (size_t i = 0; i < len; ++i) as_c[i] = {x.re[i], 0.0};
+              auto B = yafftl::fft(as_c);
+              TFW_CHECK(A.size() == B.size());
+              bool same = true;
+              for (size_t i = 0; i < A.size(); ++i) same = same && A[i] == B[i];
+              TFW_CHECK(same);
+              // Repeat determinism: same call twice -> identical values.
+              auto C2 = yafftl::fft(x.re);
+              for (size_t i = 0; i < A.size(); ++i) same = same && A[i] == C2[i];
+              TFW_CHECK(same);
+              NOTE("real overload == complex overload, bit-exact");
+          }
+
+          // compile-time guard on the documented constant
+          static_assert(yafftl::kMaxSafeIntegerFFTLen == (1ull << 20), "documented safe bound is 2^20");
+
+          // ------------------------------------------------------------------ fuzz -----
+          static int run_fuzz(int iters, uint64_t seed) {
+              std::printf("[fuzz] %d iterations, seed base %llu\n", iters, (unsigned long long)seed);
+              int failures = 0;
+              for (int it = 0; it < iters; ++it) {
+                  uint64_t s = seed + uint64_t(it) * 0x9E3779B97F4A7C15ull;
+                  const int kind = int(splitmix64(s) % 7);
+                  const size_t kmax = g_light ? 14u : 18u;
+                  const size_t k = 1 + size_t(splitmix64(s) % kmax);
+                  const size_t n = size_t(1) << k;
+                  bool ok = true;
+                  const char* tag = "?";
+                  switch (kind) {
+                      case 0: case 6: {  // round-trip (6 also uses an odd thread count)
+                          Cx x = make_input(n, true, s);
+                          yafftl::Options o{kind == 6 ? 3u : 1u, 1024u};
+                          Cx X = run_transform(x, false, o);
+                          Cx back = run_transform(X, true, o);
+                          const double e = worst_abs_diff(back, x) / scale_of(x);
+                          ok = e <= 5e-9; tag = "roundtrip";
+                          if (!ok) std::printf("[fuzz] FAIL roundtrip n=%zu err=%g seed=%llu\n",
+                                               n, e, (unsigned long long)s);
+                          break;
+                      }
+                      case 1: {  // Parseval
+                          Cx x = make_input(n, true, s);
+                          Cx X = run_transform(x, false, yafftl::Options{});
+                          double sx = 0, sX = 0;
+                          for (size_t i = 0; i < n; ++i) {
+                              sx += x.re[i] * x.re[i] + x.im[i] * x.im[i];
+                              sX += X.re[i] * X.re[i] + X.im[i] * X.im[i];
+                          }
+                          const double rel = std::fabs(sX - double(n) * sx) / (double(n) * sx);
+                          ok = rel <= 1e-8; tag = "parseval";
+                          if (!ok) std::printf("[fuzz] FAIL parseval n=%zu rel=%g seed=%llu\n",
+                                               n, rel, (unsigned long long)s);
+                          break;
+                      }
+                      case 2: {  // conjugate symmetry on real input
+                          Cx x = make_input(n, false, s);
+                          Cx X = run_transform(x, false, yafftl::Options{});
+                          double w = 0;
+                          for (size_t kk = 1; kk < n / 2; ++kk) {
+                              w = std::max(w, std::fabs(X.re[n - kk] - X.re[kk]));
+                              w = std::max(w, std::fabs(X.im[n - kk] + X.im[kk]));
+                          }
+                          ok = w <= 1e-10; tag = "conj-sym";
+                          if (!ok) std::printf("[fuzz] FAIL conj-sym n=%zu w=%g seed=%llu\n",
+                                               n, w, (unsigned long long)s);
+                          break;
+                      }
+                      case 3: {  // vs naive (small n only)
+                          if (n > 1024) break;
+                          Cx x = make_input(n, true, s);
+                          const bool inv = (splitmix64(s) & 1) != 0;
+                          Cx ref; naive_dft(x.re, x.im, ref.re, ref.im, inv);
+                          Cx got = run_transform(x, inv, yafftl::Options{});
+                          const double e = worst_abs_diff(got, ref) / scale_of(ref);
+                          ok = e <= 2e-9; tag = "naive";
+                          if (!ok) std::printf("[fuzz] FAIL naive n=%zu err=%g seed=%llu\n",
+                                               n, e, (unsigned long long)s);
+                          break;
+                      }
+                      case 4: {  // exact integer convolution
+                          const size_t Lc = n > 2048 ? 2048 : n;
+                          std::vector<double> a(Lc), b(Lc);
+                          for (auto& v : a) v = double(splitmix64(s) % 10);
+                          for (auto& v : b) v = double(splitmix64(s) % 10);
+                          std::vector<double> want = schoolbook(a, b);
+                          std::vector<double> got = yafftl::convolve(a, b);
+                          double w = 0;
+                          for (size_t i = 0; i < want.size(); ++i) w = std::max(w, std::fabs(got[i] - want[i]));
+                          ok = w < 0.45; tag = "exact-int";
+                          if (!ok) std::printf("[fuzz] FAIL exact-int L=%zu w=%g seed=%llu\n",
+                                               Lc, w, (unsigned long long)s);
+                          break;
+                      }
+                      case 5: {  // misaligned vs aligned
+                          if (n > 4096) break;
+                          Cx x = make_input(n, true, s);
+                          Cx a1 = x;
+                          yafftl::Options o;
+                          yafftl::transform(a1.re.data(), a1.im.data(), n, false, o);
+                          std::vector<double> st(2 * (n + 2));
+                          for (size_t i = 0; i < n; ++i) { st[1 + i] = x.re[i]; st[1 + n + 2 + i] = x.im[i]; }
+                          yafftl::transform(st.data() + 1, st.data() + 1 + (n + 2), n, false, o);
+                          bool same = true;
+                          for (size_t i = 0; i < n; ++i)
+                              same = same && a1.re[i] == st[1 + i] && a1.im[i] == st[1 + (n + 2) + i];
+                          ok = same; tag = "misaligned";
+                          if (!ok) std::printf("[fuzz] FAIL misaligned n=%zu seed=%llu\n", n, (unsigned long long)s);
+                          break;
+                      }
+                  }
+                  if (!ok) ++failures;
+                  if ((it + 1) % 50 == 0)
+                      std::printf("[fuzz] %d/%d done (last: %s n=%zu)\n", it + 1, iters, tag, n);
+              }
+              std::printf("[fuzz] complete: %d failures out of %d\n", failures, iters);
+              return failures;
+          }
+
+          // ------------------------------------------------------------------ main -----
+          int main(int argc, char** argv) {
+              std::string filter;
+              int fuzz_iters = 0;
+              for (int i = 1; i < argc; ++i) {
+                  const std::string a = argv[i];
+                  if (a == "--list") {
+                      for (auto& c : tfw::cases()) std::printf("%s\n", c.name);
+                      return 0;
+                  } else if (a == "--filter" && i + 1 < argc) filter = argv[++i];
+                  else if (a == "--fuzz" && i + 1 < argc) fuzz_iters = std::atoi(argv[++i]);
+                  else if (a == "--seed" && i + 1 < argc) g_seed_base = strtoull(argv[++i], nullptr, 0);
+                  else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }
+              }
+              g_light = env_flag("YAFFTL_TEST_LIGHT");
+              g_full = env_flag("YAFFTL_TEST_FULL");
+              if (g_full) g_light = false;
+
+              std::printf("=== YAFFTL correctness suite ===\n");
+              std::printf("config: compiler=%s", compiler_id());
+          #if defined(__clang__)
+              std::printf(" %d.%d", __clang_major__, __clang_minor__);
+          #elif defined(__GNUC__)
+              std::printf(" %d.%d", __GNUC__, __GNUC_MINOR__);
+          #elif defined(_MSC_VER)
+              std::printf(" %d", _MSC_VER);
+          #endif
+              std::printf(" | simd=%d avx512=%d | light=%d full=%d | hw_threads=%u\n",
+                           YAFFTL_SIMD, YAFFTL_AVX512, g_light ? 1 : 0, g_full ? 1 : 0,
+                           std::thread::hardware_concurrency());
+
+              int failed_tests = 0;
+              for (auto& c : tfw::cases()) {
+                  if (!filter.empty() && std::string(c.name).find(filter) == std::string::npos) continue;
+                  g_note.clear();
+                  tfw::cur_failed() = false;
+                  const auto t0 = std::chrono::steady_clock::now();
+                  std::printf("[ RUN ] %s\n", c.name);
+                  c.fn();
+                  const double ms = std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() - t0).count();
+                  if (tfw::cur_failed()) { ++failed_tests; std::printf("[FAIL] %s (%.0f ms)%s%s\n", c.name, ms,
+                                   g_note.empty() ? "" : "  -- ", g_note.c_str()); }
+                  else std::printf("[ OK ] %s (%.0f ms)%s%s\n", c.name, ms,
+                                   g_note.empty() ? "" : "  -- ", g_note.c_str());
+              }
+
+              int fuzz_failures = 0;
+              if (fuzz_iters > 0) fuzz_failures = run_fuzz(fuzz_iters, g_seed_base);
+
+              const int total = static_cast<int>(tfw::cases().size());
+              std::printf("--- summary: %d tests, %d failed | %ld checks, %ld failed | fuzz: %s ---\n",
+                          total, failed_tests, tfw::n_checks(), tfw::n_fails(),
+                          fuzz_iters ? (fuzz_failures ? "FAILED" : "clean") : "off");
+              return (failed_tests + fuzz_failures) ? 1 : 0;
+          }
+          YAFFTL_EOF
+          cat > "${RUNNER_TEMP}/ysrc/tu_main.cpp" <<'YAFFTL_EOF'
+          // tu_main.cpp — ODR / two-translation-unit check (linked with tu_second.cpp).
+          // yafftl.hpp must be includable from many TUs without multiple-definition
+          // errors at link time; the marker from the other TU forces out-of-line use of
+          // the inline API across TUs.
+          #include "yafftl.hpp"
+
+          #include <cmath>
+          #include <cstdio>
+          #include <vector>
+
+          long long yafftl_tu2_marker();  // defined in tu_second.cpp
+
+          int main() {
+              std::vector<double> x(64);
+              for (int i = 0; i < 64; ++i) x[i] = std::sin(double(i) * 0.1);
+              auto X = yafftl::fft(x);
+              auto back = yafftl::ifft(X);
+              double err = 0;
+              for (int i = 0; i < 64; ++i) err = std::max(err, std::fabs(back[i].real() - x[i]));
+              const long long marker = yafftl_tu2_marker();
+              const bool ok = err < 1e-9 && marker == 260;  // convolve({1..4},{5..8}) sums to (1+2+3+4)*(5+6+7+8)
+              std::printf("two-tu: roundtrip err=%.3g, marker=%lld -> %s\n", err, marker, ok ? "OK" : "FAIL");
+              return ok ? 0 : 1;
+          }
+          YAFFTL_EOF
+          cat > "${RUNNER_TEMP}/ysrc/tu_second.cpp" <<'YAFFTL_EOF'
+          // tu_second.cpp — see tu_main.cpp. A second TU that includes yafftl.hpp.
+          #include "yafftl.hpp"
+
+          #include <cmath>
+
+          long long yafftl_tu2_marker() {
+              const std::vector<double> a{1.0, 2.0, 3.0, 4.0};
+              const std::vector<double> b{5.0, 6.0, 7.0, 8.0};
+              const std::vector<double> c = yafftl::convolve(a, b);
+              long long s = 0;
+              for (double v : c) s += static_cast<long long>(std::lround(v));
+              return s;
+          }
+          YAFFTL_EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yafftl-ci-sources
+          path: ${{ runner.temp }}/ysrc/
+          retention-days: 1
+          if-no-files-found: error
+
+  linux:
+    name: linux ${{ matrix.cxx }} ${{ matrix.simd }} ${{ matrix.build }}
+    needs: src
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cxx: g++,     simd: scalar, build: release, flags: "" }
+          - { cxx: g++,     simd: avx2,   build: release, flags: "-mavx2 -mfma" }
+          - { cxx: g++,     simd: scalar, build: debug,   flags: "" }
+          - { cxx: clang++, simd: scalar, build: release, flags: "" }
+          - { cxx: clang++, simd: avx2,   build: release, flags: "-mavx2 -mfma" }
+          - { cxx: clang++, simd: scalar, build: debug,   flags: "" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: yafftl-ci-sources
+          path: ${{ runner.temp }}/ysrc
+      - name: install clang
+        if: matrix.cxx == 'clang++'
+        run: sudo apt-get update -q && sudo apt-get install -y -q clang
+      - name: build and run
+        run: |
+          set -euo pipefail
+          SRC="${RUNNER_TEMP}/ysrc"
+          BIN="${RUNNER_TEMP}/ybin"
+          mkdir -p "$BIN"
+          OPT="-O2 -g"
+          if [ "${{ matrix.build }}" = "debug" ]; then OPT="-O0 -g -fno-inline"; fi
+          SIMD="${{ matrix.flags }}"
+          # shellcheck disable=SC2086
+          "${{ matrix.cxx }}" -std=c++17 $OPT $SIMD -Wall -Wextra -pthread \
+            -I. -I"$SRC" -o "$BIN/test" "$SRC/test_correctness.cpp"
+          "$BIN/test"
+          # two-TU ODR / link check
+          # shellcheck disable=SC2086
+          "${{ matrix.cxx }}" -std=c++17 $OPT $SIMD -Wall -Wextra -pthread \
+            -I. -I"$SRC" -o "$BIN/twotu" "$SRC/tu_main.cpp" "$SRC/tu_second.cpp"
+          "$BIN/twotu"
+
+  avx512:
+    name: avx512 ${{ matrix.cxx }}
+    needs: src
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: yafftl-ci-sources
+          path: ${{ runner.temp }}/ysrc
+      - name: install clang
+        if: matrix.cxx == 'clang++'
+        run: sudo apt-get update -q && sudo apt-get install -y -q clang
+      - name: detect AVX-512
+        id: cpu
+        run: |
+          has_flag() { awk -F': ' '/^flags/{print $2; exit}' /proc/cpuinfo | tr ', ' '\n\n' | grep -qx "$1"; }
+          if has_flag avx512f && has_flag avx512dq; then
+            echo "mode=native" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=sde" >> "$GITHUB_OUTPUT"
+          fi
+      - name: fetch Intel SDE
+        if: steps.cpu.outputs.mode == 'sde'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "${RUNNER_TEMP}/sde.tar.xz" \
+            "https://downloadmirror.intel.com/924984/sde-external-10.13.1-2026-07-28-lin.tar.xz"
+          mkdir -p "${RUNNER_TEMP}/sde"
+          tar -xJf "${RUNNER_TEMP}/sde.tar.xz" -C "${RUNNER_TEMP}/sde" --strip-components=1
+      - name: build and run
+        run: |
+          set -euo pipefail
+          SRC="${RUNNER_TEMP}/ysrc"
+          BIN="${RUNNER_TEMP}/ybin"
+          mkdir -p "$BIN"
+          wrapper=()
+          if [ "${{ steps.cpu.outputs.mode }}" = "sde" ]; then
+            export YAFFTL_TEST_LIGHT=1   # emulation is slow; trim the heavy cases
+            wrapper=("${RUNNER_TEMP}/sde/sde64" "--")
+          fi
+          "${{ matrix.cxx }}" -std=c++17 -O2 -g -mavx512f -mavx512dq -Wall -Wextra -pthread \
+            -I. -I"$SRC" -o "$BIN/test512" "$SRC/test_correctness.cpp"
+          "${wrapper[@]}" "$BIN/test512"
+          "${{ matrix.cxx }}" -std=c++17 -O2 -g -mavx512f -mavx512dq -Wall -Wextra -pthread \
+            -I. -I"$SRC" -o "$BIN/twotu" "$SRC/tu_main.cpp" "$SRC/tu_second.cpp"
+          "${wrapper[@]}" "$BIN/twotu"
+
+  sanitizers:
+    name: ${{ matrix.san }} ${{ matrix.simd }}
+    needs: src
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { san: asan+ubsan, simd: scalar, flags: "" }
+          - { san: asan+ubsan, simd: avx2,   flags: "-mavx2 -mfma" }
+          - { san: tsan,       simd: scalar, flags: "" }
+          - { san: tsan,       simd: avx2,   flags: "-mavx2 -mfma" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: yafftl-ci-sources
+          path: ${{ runner.temp }}/ysrc
+      - name: install clang
+        run: sudo apt-get update -q && sudo apt-get install -y -q clang
+      - name: build and run
+        env:
+          ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: |
+          set -euo pipefail
+          SRC="${RUNNER_TEMP}/ysrc"
+          BIN="${RUNNER_TEMP}/ybin"
+          mkdir -p "$BIN"
+          SIMD="${{ matrix.flags }}"
+          SFS=""
+          if [ "${{ matrix.san }}" = "tsan" ]; then
+            SFS="-fsanitize=thread"; export YAFFTL_TEST_LIGHT=1
+          else
+            SFS="-fsanitize=address,undefined -fno-sanitize-recover=all"
+          fi
+          # shellcheck disable=SC2086
+          clang++ -std=c++17 -O1 -g $SFS $SIMD -Wall -Wextra -pthread \
+            -I. -I"$SRC" -o "$BIN/test" "$SRC/test_correctness.cpp"
+          "$BIN/test"
+
+  msvc:
+    name: msvc ${{ matrix.arch || 'default' }}
+    needs: src
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ['', '/arch:AVX2', '/arch:AVX512']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: yafftl-ci-sources
+          path: ${{ runner.temp }}/ysrc
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: build and run
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = "${env:RUNNER_TEMP}\ysrc"
+          $bin = "${env:RUNNER_TEMP}\ybin"
+          New-Item -ItemType Directory -Force $bin | Out-Null
+          $arch = "${{ matrix.arch }}"
+          $extra = @()
+          if ($arch) { $extra = $arch.Split(' ') }
+          & cl /nologo /std:c++17 /EHsc /O2 /W3 @extra /I. /I"$src" `
+              /Fo"$bin\" /Fe"$bin\test.exe" "$src\test_correctness.cpp"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & "$bin\test.exe"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & cl /nologo /std:c++17 /EHsc /O2 /W3 @extra /I. /I"$src" `
+              /Fo"$bin\" /Fe"$bin\twotu.exe" "$src\tu_main.cpp" "$src\tu_second.cpp"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & "$bin\twotu.exe"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+  macos:
+    name: macos scalar (arm64)
+    needs: src
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: yafftl-ci-sources
+          path: ${{ runner.temp }}/ysrc
+      - name: build and run
+        run: |
+          set -euo pipefail
+          SRC="${RUNNER_TEMP}/ysrc"
+          BIN="${RUNNER_TEMP}/ybin"
+          mkdir -p "$BIN"
+          clang++ -std=c++17 -O2 -g -Wall -Wextra -pthread \
+            -I. -I"$SRC" -o "$BIN/test" "$SRC/test_correctness.cpp"
+          "$BIN/test"
+          clang++ -std=c++17 -O2 -g -Wall -Wextra -pthread \
+            -I. -I"$SRC" -o "$BIN/twotu" "$SRC/tu_main.cpp" "$SRC/tu_second.cpp"
+          "$BIN/twotu"
+
+  lint:
+    name: lint -Werror (${{ matrix.cxx }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cxx: g++,     flags: "" }
+          - { cxx: g++,     flags: "-mavx512f -mavx512dq" }
+          - { cxx: clang++, flags: "" }
+          - { cxx: clang++, flags: "-mavx512f -mavx512dq" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: install clang
+        if: matrix.cxx == 'clang++'
+        run: sudo apt-get update -q && sudo apt-get install -y -q clang
+      - name: header must be warning-clean
+        run: |
+          set -euo pipefail
+          SIMD="${{ matrix.flags }}"
+          printf '#include "yafftl.hpp"\nint main() { return 0; }\n' > "${RUNNER_TEMP}/header_only.cpp"
+          # shellcheck disable=SC2086
+          "${{ matrix.cxx }}" -std=c++17 -O2 $SIMD -Wall -Wextra -Wpedantic -Wshadow -Werror \
+            -I. -c "${RUNNER_TEMP}/header_only.cpp" -o /dev/null
+          echo "header is warning-clean under -Wall -Wextra -Wpedantic -Wshadow -Werror"

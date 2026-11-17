@@ -1,0 +1,432 @@
+# Performance — YAFFTL benchmark sweeps with history and regression alerts.
+#
+# Quick sweep + comparison comment on every PR to main, full sweep weekly
+# (Mon 03:00 UTC) and on demand. Results are stored on the 'benchmark-data'
+# branch via github-action-benchmark (customSmallerIsBetter; all values in ms
+# so charts and alerts are consistent). Alert on >30% regression, never fail
+# the build (shared runners are noisy: the harness reports CoV and flags any
+# measurement with CoV > 20%).
+#
+# The benchmark source is generated at run time by the heredoc below; one
+# binary per SIMD mode (scalar / AVX2 / AVX-512 when the host exposes it),
+# built with fixed flags so the history series stay comparable across runners.
+
+name: Performance
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'quick | full'
+        default: 'quick'
+        type: string
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  benchmark:
+    name: sweep (${{ github.event_name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      PROFILE: ${{ github.event_name == 'schedule' && 'full' || inputs.profile || 'quick' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: detect CPU
+        run: |
+          set -euo pipefail
+          {
+            awk -F': ' '/^model name/{print "cpu: " $2; exit}' /proc/cpuinfo
+            echo "nproc: $(nproc)"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          MODES="scalar avx2"
+          if awk -F': ' '/^flags/{print $2; exit}' /proc/cpuinfo | tr ', ' '\n\n' | grep -qx avx512f \
+             && awk -F': ' '/^flags/{print $2; exit}' /proc/cpuinfo | tr ', ' '\n\n' | grep -qx avx512dq; then
+            MODES="scalar avx2 avx512"
+          fi
+          echo "MODES=$MODES" >> "$GITHUB_ENV"
+          echo "modes: $MODES" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: generate bench source
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/ysrc" results
+          cat > "${RUNNER_TEMP}/ysrc/bench_fft.cpp" <<'YAFFTL_EOF'
+          // bench_fft.cpp — YAFFTL performance harness (single file, zero dependencies).
+          //
+          // Embedded at CI time by .github/workflows/performance.yml and
+          // release-compare.yml; compiled directly against a checkout's yafftl.hpp.
+          //
+          // Measures, with median-of-reps and adaptive inner-loop sizing:
+          //   transform  — low-level in-place forward transform (the fast path)
+          //   roundtrip  — high-level ifft(fft(x)) including allocations (user path)
+          //   convolve   — high-level linear convolution
+          //   scaling    — threads = 1..T at a large size (parallel_threshold lowered)
+          //
+          // Outputs a human table on stdout and a JSON file in the
+          // github-action-benchmark "customSmallerIsBetter" format:
+          //   {"schemaVersion":1,"benchmarks":[{"name","value","unit","range","extra"}]}
+          // All values are milliseconds (smaller = better) so the history charts and
+          // regression alerts are consistent.
+          //
+          // CLI: --profile quick|full   --json PATH   --prefix STR
+          //      --threads 1,2,4|auto   --seed N      --reps N   --target-ms N
+
+          #include "yafftl.hpp"
+
+          #include <algorithm>
+          #include <chrono>
+          #include <cmath>
+          #include <cstdint>
+          #include <cstdlib>
+          #include <cstring>
+          #include <cstdio>
+          #include <fstream>
+          #include <sstream>
+          #include <string>
+          #include <thread>
+          #include <vector>
+
+          // ------------------------------------------------------------------- RNG -----
+          static uint64_t splitmix64(uint64_t& s) {
+              s += 0x9E3779B97F4A7C15ull;
+              uint64_t z = s;
+              z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+              z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+              return z ^ (z >> 31);
+          }
+          static double next_dbl(uint64_t& s) {
+              return (static_cast<double>(splitmix64(s) >> 11) * (1.0 / 9007199254740992.0)) * 2.0 - 1.0;
+          }
+
+          // ---------------------------------------------------------------- timing -----
+          struct Result {
+              double med_ms = 0, min_ms = 0, max_ms = 0, cov_pct = 0;
+          };
+
+          static double now_ms() {
+              return std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now().time_since_epoch()).count();
+          }
+
+          // `once` performs exactly one benchmark iteration.
+          template <class F>
+          static Result measure(F&& once, int reps, double target_ms) {
+              std::vector<double> per_iter;
+              per_iter.reserve(reps);
+              double est = -1.0;
+              for (int r = 0; r < reps; ++r) {
+                  if (est <= 0) {  // calibrate
+                      double t0 = now_ms();
+                      once();
+                      est = now_ms() - t0;
+                      if (est <= 0) est = 1e-4;
+                  }
+                  uint64_t K = std::max<uint64_t>(1, uint64_t(target_ms / est));
+                  if (K > 2000000ull) K = 2000000ull;
+                  const double t0 = now_ms();
+                  for (uint64_t i = 0; i < K; ++i) once();
+                  const double seg = now_ms() - t0;
+                  per_iter.push_back(seg / double(K));
+                  est = per_iter.back();  // re-calibrate next rep from the freshest estimate
+              }
+              std::sort(per_iter.begin(), per_iter.end());
+              Result res;
+              res.med_ms = per_iter[per_iter.size() / 2];
+              res.min_ms = per_iter.front();
+              res.max_ms = per_iter.back();
+              double sum = 0, sq = 0;
+              for (double v : per_iter) { sum += v; sq += v * v; }
+              const double mean = sum / per_iter.size();
+              const double var = std::max(0.0, sq / per_iter.size() - mean * mean);
+              res.cov_pct = std::sqrt(var) / std::max(1e-12, mean) * 100.0;
+              return res;
+          }
+
+          // ------------------------------------------------------------------ state ----
+          struct Bench {
+              std::string prefix = "bench";
+              std::vector<std::pair<std::string, Result>> rows;   // json rows
+              int unstable = 0;
+
+              void add(const std::string& name, const Result& r) {
+                  rows.push_back({name, r});
+                  if (r.cov_pct > 20.0) ++unstable;
+              }
+          };
+
+          static void print_row(const char* section, size_t n, const char* cfg, const Result& r,
+                                const char* extra) {
+              const double mpoints = double(n) / (r.med_ms / 1000.0) / 1e6;
+              std::printf("%-10s %8zu  %-12s %10.4f ms %10.4f %8.4f %7.1f%% %10.2f M/s  %s\n",
+                          section, n, cfg, r.med_ms, r.min_ms, r.max_ms, r.cov_pct, mpoints, extra ? extra : "");
+          }
+
+          static std::string cpu_model() {
+              std::ifstream f("/proc/cpuinfo");
+              std::string line;
+              while (std::getline(f, line))
+                  if (line.compare(0, 10, "model name") == 0) {
+                      const size_t c = line.find(':');
+                      if (c != std::string::npos) return line.substr(c + 2);
+                  }
+              return "unknown";
+          }
+
+          // ---------------------------------------------------------------- sections ---
+          static void self_check() {
+              const size_t n = 65536;
+              std::vector<double> re(n), im(n);
+              uint64_t s = 0xBEEF;
+              for (size_t i = 0; i < n; ++i) { re[i] = next_dbl(s); im[i] = next_dbl(s); }
+              std::vector<double> re0 = re, im0 = im;
+              yafftl::Options o;
+              yafftl::transform(re.data(), im.data(), n, false, o);
+              yafftl::transform(re.data(), im.data(), n, true, o);
+              double err = 0;
+              for (size_t i = 0; i < n; ++i)
+                  err = std::max(err, std::max(std::fabs(re[i] - re0[i]), std::fabs(im[i] - im0[i])));
+              if (err > 1e-8) {
+                  std::fprintf(stderr, "bench: self-check FAILED (roundtrip err %g) — build is broken\n", err);
+                  std::exit(1);
+              }
+              std::printf("self-check: 2^16 roundtrip err %.3g — OK\n", err);
+          }
+
+          static void section_transform(Bench& B, const std::vector<size_t>& sizes, int reps,
+                                        double target_ms, uint64_t seed) {
+              std::printf("\n%-10s %8s  %-12s %13s %10s %8s %7s %11s\n",
+                          "SECTION", "N", "CONFIG", "MEDIAN", "MIN", "MAX", "CoV", "THROUGHPUT");
+              for (size_t n : sizes) {
+                  std::vector<double> re(n), im(n);
+                  uint64_t s = seed + n;
+                  for (size_t i = 0; i < n; ++i) { re[i] = next_dbl(s); im[i] = next_dbl(s); }
+                  double* rp = re.data();
+                  double* ip = im.data();
+                  yafftl::Options o;  // single-threaded: the library default
+                  Result r = measure([&] { yafftl::transform(rp, ip, n, false, o); }, reps, target_ms);
+                  const std::string name = B.prefix + "/transform/" + std::to_string(n);
+                  B.add(name, r);
+                  print_row("transform", n, "fwd 1-thread", r, "");
+              }
+          }
+
+          static void section_roundtrip(Bench& B, const std::vector<size_t>& sizes, int reps,
+                                        double target_ms, uint64_t seed) {
+              for (size_t n : sizes) {
+                  std::vector<std::complex<double>> x(n);
+                  uint64_t s = seed + n * 7;
+                  for (size_t i = 0; i < n; ++i) x[i] = {next_dbl(s), next_dbl(s)};
+                  Result r = measure([&] { auto X = yafftl::fft(x); auto Y = yafftl::ifft(X); (void)Y; },
+                                     reps, target_ms);
+                  const std::string name = B.prefix + "/roundtrip/" + std::to_string(n);
+                  B.add(name, r);
+                  print_row("roundtrip", n, "fft+ifft", r, "");
+              }
+          }
+
+          static void section_convolve(Bench& B, const std::vector<size_t>& sizes, int reps,
+                                       double target_ms, uint64_t seed) {
+              for (size_t n : sizes) {  // n is the transform length: a, b of length n/2 each
+                  const size_t half = n / 2;
+                  std::vector<double> a(half), b(half);
+                  uint64_t s = seed + n * 13;
+                  for (size_t i = 0; i < half; ++i) { a[i] = next_dbl(s); b[i] = next_dbl(s); }
+                  Result r = measure([&] { auto c = yafftl::convolve(a, b); (void)c; }, reps, target_ms);
+                  const std::string name = B.prefix + "/convolve/" + std::to_string(n);
+                  B.add(name, r);
+                  print_row("convolve", n, "len n/2+n/2", r, "");
+              }
+          }
+
+          static void section_scaling(Bench& B, size_t n, const std::vector<unsigned>& threads,
+                                      int reps, double target_ms, uint64_t seed) {
+              std::vector<double> re(n), im(n);
+              uint64_t s = seed + 99;
+              for (size_t i = 0; i < n; ++i) { re[i] = next_dbl(s); im[i] = next_dbl(s); }
+              double base_ms = -1;
+              for (unsigned t : threads) {
+                  yafftl::Options o{t, 1u << 12};  // lowered threshold so threading can engage
+                  double* rp = re.data();
+                  double* ip = im.data();
+                  Result r = measure([&] { yafftl::transform(rp, ip, n, false, o); }, reps, target_ms);
+                  if (t == 1) base_ms = r.med_ms;
+                  char cfg[32];
+                  std::snprintf(cfg, sizeof(cfg), "t=%u", t);
+                  char extra[80];
+                  std::snprintf(extra, sizeof(extra), "speedup %.2fx",
+                                base_ms > 0 ? base_ms / r.med_ms : 1.0);
+                  const std::string name = B.prefix + "/scaling/" + std::to_string(n) + "/t" + std::to_string(t);
+                  B.add(name, r);
+                  print_row("scaling", n, cfg, r, extra);
+              }
+              // Default configuration (library tuning, threshold 2^18) for reference.
+              {
+                  yafftl::Options o;  // defaults: threads=1
+                  double* rp = re.data();
+                  double* ip = im.data();
+                  Result r = measure([&] { yafftl::transform(rp, ip, n, false, o); }, reps, target_ms);
+                  const std::string name = B.prefix + "/scaling/" + std::to_string(n) + "/default";
+                  B.add(name, r);
+                  print_row("scaling", n, "default", r, "library defaults");
+              }
+          }
+
+          // ------------------------------------------------------------------- JSON ----
+          static void write_json(const Bench& B, const std::string& path) {
+              std::ofstream f(path);
+              f << "{\"schemaVersion\":1,\"benchmarks\":[";
+              for (size_t i = 0; i < B.rows.size(); ++i) {
+                  const auto& r = B.rows[i];
+                  f << (i ? "," : "");
+                  f << "{\"name\":\"" << r.first << "\",\"value\":" << r.second.med_ms
+                    << ",\"unit\":\"ms\",\"range\":[" << r.second.min_ms << "," << r.second.max_ms
+                    << "],\"extra\":\"cov=" << r.second.cov_pct << "%\"}";
+              }
+              f << "]}\n";
+              if (!f) { std::fprintf(stderr, "bench: failed to write %s\n", path.c_str()); std::exit(1); }
+              std::printf("\njson: %zu benchmarks written to %s\n", B.rows.size(), path.c_str());
+          }
+
+          // ------------------------------------------------------------------- main -----
+          int main(int argc, char** argv) {
+              std::string profile = "quick", json_path, prefix = "bench", threads_arg = "auto";
+              int reps = 0;
+              double target_ms = 0;
+              uint64_t seed = 0x1234ABCDull;
+              for (int i = 1; i < argc; ++i) {
+                  const std::string a = argv[i];
+                  auto next = [&]() -> std::string { return (i + 1 < argc) ? std::string(argv[++i]) : ""; };
+                  if (a == "--profile") profile = next();
+                  else if (a == "--json") json_path = next();
+                  else if (a == "--prefix") prefix = next();
+                  else if (a == "--threads") threads_arg = next();
+                  else if (a == "--reps") reps = std::atoi(next().c_str());
+                  else if (a == "--target-ms") target_ms = std::atof(next().c_str());
+                  else if (a == "--seed") seed = strtoull(next().c_str(), nullptr, 0);
+                  else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }
+              }
+
+              const bool full = profile == "full";
+              if (reps <= 0) reps = full ? 11 : 5;
+              if (target_ms <= 0) target_ms = full ? 60.0 : 25.0;
+
+              std::vector<unsigned> threads;
+              {
+                  unsigned hw = std::thread::hardware_concurrency();
+                  if (hw == 0) hw = 2;
+                  if (threads_arg == "auto") {
+                      threads.push_back(1);
+                      for (unsigned t = 2; t <= 4; ++t)
+                          if (t <= hw) threads.push_back(t);
+                  } else {
+                      std::string tok;
+                      std::stringstream ss(threads_arg);
+                      while (std::getline(ss, tok, ',')) threads.push_back(unsigned(std::atoi(tok.c_str())));
+                  }
+              }
+
+              std::printf("=== YAFFTL benchmark ===\n");
+              std::printf("cpu: %s | %u logical cores | simd=%d avx512=%d\n",
+                          cpu_model().c_str(), std::thread::hardware_concurrency(), YAFFTL_SIMD, YAFFTL_AVX512);
+              std::printf("profile=%s reps=%d target=%.0fms threads:", profile.c_str(), reps, target_ms);
+              for (unsigned t : threads) std::printf(" %u", t);
+              std::printf("\n");
+
+              self_check();
+
+              Bench B;
+              B.prefix = prefix;
+
+              std::vector<size_t> t_sizes, r_sizes, c_sizes;
+              {
+                  const unsigned kmax_t = full ? 20u : 18u;
+                  const unsigned kmax_r = full ? 20u : 18u;
+                  const unsigned kmax_c = full ? 18u : 15u;
+                  for (unsigned k = 10; k <= kmax_t; ++k) t_sizes.push_back(size_t(1) << k);
+                  for (unsigned k = 10; k <= kmax_r; ++k) r_sizes.push_back(size_t(1) << k);
+                  for (unsigned k = 10; k <= kmax_c; ++k) c_sizes.push_back(size_t(1) << k);
+              }
+              const size_t scaling_n = full ? size_t(1) << 20 : size_t(1) << 18;
+
+              section_transform(B, t_sizes, reps, target_ms, seed);
+              section_roundtrip(B, r_sizes, reps, target_ms, seed + 5);
+              section_convolve(B, c_sizes, reps, target_ms, seed + 11);
+              section_scaling(B, scaling_n, threads, reps, target_ms, seed + 17);
+
+              std::printf("\n--- %zu measurements, %d with CoV > 20%% (unstable) ---\n",
+                          B.rows.size(), B.unstable);
+
+              if (!json_path.empty()) write_json(B, json_path);
+              return 0;
+          }
+          YAFFTL_EOF
+      - name: build and run each mode
+        run: |
+          set -euo pipefail
+          BIN="${RUNNER_TEMP}/ybin"; mkdir -p "$BIN"
+          for mode in ${MODES}; do
+            case "$mode" in
+              scalar) F="" ;;
+              avx2)   F="-mavx2 -mfma" ;;
+              avx512) F="-mavx512f -mavx512dq" ;;
+            esac
+            # shellcheck disable=SC2086
+            g++ -std=c++17 -O3 -g $F -Wall -Wextra -pthread \
+              -I. -I"${RUNNER_TEMP}/ysrc" -o "$BIN/bench_$mode" "${RUNNER_TEMP}/ysrc/bench_fft.cpp"
+            "$BIN/bench_$mode" --profile "$PROFILE" --prefix "$mode" \
+              --threads auto --json "results/$mode.json" | tee "results/$mode.log"
+          done
+      - name: merge JSON
+        run: |
+          python3 - <<'PY'
+          import json, glob
+          merged = []
+          for p in sorted(glob.glob("results/*.json")):
+              merged += json.load(open(p))["benchmarks"]
+          json.dump({"schemaVersion": 1, "benchmarks": merged}, open("benchmark.json", "w"), indent=1)
+          print(f"merged {len(merged)} benchmarks -> benchmark.json")
+          PY
+      - name: store results and compare with baseline
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: 'YAFFTL performance'
+          tool: 'customSmallerIsBetter'
+          output-file-path: benchmark.json
+          gh-pages-branch: benchmark-data
+          benchmark-data-dir-path: perf
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: ${{ github.event_name != 'pull_request' }}
+          alert-threshold: '130%'
+          comment-on-alert: true
+          comment-always: true
+          fail-on-alert: false
+      - name: headline summary
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "### YAFFTL performance summary"
+            echo
+            echo '```'
+            grep -h -E "transform +(262144|1048576)|scaling" results/*.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results
+          path: |
+            results/
+            benchmark.json
+          if-no-files-found: warn
